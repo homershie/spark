@@ -394,6 +394,13 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodRaycastIntervalMs: number;
     lastLodRaycastTime: number;
     lodWorker: SplatWorker | null;
+    /**
+     * 上一幀參與 LoD 的 mesh 與「預期的 version」;driveLod 用 `mesh.version > 記錄值` 判髒。
+     * ⚠️ `updateLodIndices` 套用一片時自己會 bump version(+1,下一幀 accumulator 看到 numSplats
+     * 變了再 +1),那裡會把記錄提到 `mesh.version + 1` 讓自己的 bump 不算髒 —— 否則每套用一片
+     * 就自己標髒、round 永遠跑不完。附帶效果:原子模式(lodSliceMs = 0)站著不動時也不再每幀
+     * 無止境重跑 traverse(v2.1.0 是會的,只是原子之下看不出來)。
+     */
     lodMeshes: {
         mesh: SplatMesh;
         version: number;

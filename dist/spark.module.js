@@ -10878,6 +10878,8 @@ const _SparkRenderer = class _SparkRenderer extends THREE.Mesh {
         }
       }
       mesh.updateMappingVersion();
+      const rec = this.lodMeshes.find((r) => r.mesh === mesh);
+      if (rec) rec.version = mesh.version + 1;
     }
   }
   async readbackDepth({
