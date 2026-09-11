@@ -18,6 +18,7 @@ mod packed_splats;
 mod ext_splats;
 
 mod lod_tree;
+mod lod_traverse;
 
 #[wasm_bindgen(start)]
 pub fn wasm_start() {

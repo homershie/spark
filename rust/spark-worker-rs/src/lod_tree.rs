@@ -1,152 +1,48 @@
-use std::{array, cell::{Ref, RefCell}, collections::BinaryHeap, rc::Rc};
+use std::{array, cell::{Ref, RefCell}, rc::Rc};
 
-use ahash::{AHashMap, AHashSet};
-use glam::{Vec3, Vec3A};
+use ahash::AHashMap;
+use glam::Vec3;
 use half::f16;
 use itertools::izip;
 use js_sys::{Array, Object, Reflect, Uint32Array};
-use ordered_float::OrderedFloat;
 use wasm_bindgen::prelude::*;
+
+use crate::lod_traverse::{
+    expand_until, is_fresh, seed_roots, InstanceParams, LoopExit, RoundMeta, TraverseCore, TreeView,
+};
 
 const MAX_SPLAT_CHUNK: usize = 65536;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
-struct FourHeap<T: Ord> {
-    data: Vec<T>,
-}
-
-#[allow(dead_code)]
-impl<T: Ord> FourHeap<T> {
-    fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    fn push(&mut self, value: T) {
-        self.data.push(value);
-        let mut index = self.data.len() - 1;
-        while index > 0 {
-            let parent = (index - 1) / 4;
-            if self.data[parent] >= self.data[index] {
-                break;
-            }
-            self.data.swap(parent, index);
-            index = parent;
-        }
-    }
-
-    fn peek(&self) -> Option<&T> {
-        self.data.first()
-    }
-
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    fn pop(&mut self) -> Option<T> {
-        let last = self.data.pop()?;
-        if self.data.is_empty() {
-            return Some(last);
-        }
-
-        let root = std::mem::replace(&mut self.data[0], last);
-        let len = self.data.len();
-        let mut index = 0usize;
-        loop {
-            let child0 = index * 4 + 1;
-            if child0 >= len {
-                break;
-            }
-
-            let child_end = (child0 + 4).min(len);
-            let mut max_child = child0;
-            for child in (child0 + 1)..child_end {
-                if self.data[child] > self.data[max_child] {
-                    max_child = child;
-                }
-            }
-
-            if self.data[index] >= self.data[max_child] {
-                break;
-            }
-            self.data.swap(index, max_child);
-            index = max_child;
-        }
-
-        Some(root)
-    }
-
-    fn drain(&mut self) -> std::vec::Drain<'_, T> {
-        self.data.drain(..)
-    }
-
-    fn clear(&mut self) {
-        self.data.clear();
-    }
-}
-
-type Frontier<T> = BinaryHeap<T>;
-
-#[derive(Debug, Clone, Default)]
-struct LodSplat {
-    center: [f16; 3],
-    size: f16,
-    child_start: u32,
-    child_count: u16,
+pub(crate) struct LodSplat {
+    pub(crate) center: [f16; 3],
+    pub(crate) size: f16,
+    pub(crate) child_start: u32,
+    pub(crate) child_count: u16,
 }
 
 impl LodSplat {
-    fn new_f16(center: [f16; 3], size: f16, child_start: u32, child_count: u16) -> Self {
+    pub(crate) fn new_f16(center: [f16; 3], size: f16, child_start: u32, child_count: u16) -> Self {
         Self { center, size, child_start, child_count }
     }
 
-    #[allow(dead_code)]
-    fn new(center: Vec3, size: f32, child_start: u32, child_count: u16) -> Self {
+    /// 只有 `lod_traverse::tests` 用得到(建構測試用的樹);release/wasm build 不含
+    /// `#[cfg(test)]`,那裡它是真的死碼,故 `allow` 只在非 test build 生效。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(center: Vec3, size: f32, child_start: u32, child_count: u16) -> Self {
         let center = center.to_array().map(|x| f16::from_f32(x));
         let size = f16::from_f32(size);
         Self::new_f16(center, size, child_start, child_count)
     }
 
-    fn center(&self) -> Vec3A {
-        Vec3A::from_array(self.center.map(|x| x.to_f32()))
+    pub(crate) fn center(&self) -> glam::Vec3A {
+        glam::Vec3A::from_array(self.center.map(|x| x.to_f32()))
     }
 
-    fn size(&self) -> f32 {
+    pub(crate) fn size(&self) -> f32 {
         self.size.to_f32()
     }
 }
-
-// #[derive(Debug, Clone, Default)]
-// struct LodSplat {
-//     center: Vec3,
-//     size: f32,
-//     child_start: u32,
-//     child_count: u16,
-// }
-
-// impl LodSplat {
-//     fn new_f16(center: [f16; 3], size: f16, child_start: u32, child_count: u16) -> Self {
-//         let center = Vec3::from_array(center.map(|x| x.to_f32()));
-//         let size = size.to_f32();
-//         Self::new(center, size, child_start, child_count)
-//     }
-
-//     fn new(center: Vec3, size: f32, child_start: u32, child_count: u16) -> Self {
-//         Self { center, size, child_start, child_count }
-//     }
-
-//     fn center(&self) -> Vec3A {
-//         self.center.to_vec3a()
-//     }
-
-//     fn size(&self) -> f32 {
-//         self.size
-//     }
-// }
 
 #[derive(Debug, Clone, Default)]
 struct LodTree {
@@ -158,10 +54,10 @@ struct LodTree {
 struct LodState {
     next_id: u32,
     lod_trees: AHashMap<u32, LodTree>,
-    frontier: Frontier<(OrderedFloat<f32>, u32, u32)>,
-    output: Vec<(u32, u32)>,
-    touched: Vec<(u32, u32)>,
-    touched_set: AHashSet<(u32, u32)>,
+    /// traverse 的跨呼叫狀態(frontier/output/touched);round 存活期間不 clear。
+    core: TraverseCore,
+    /// 目前這一輪的固定參數;`None` = 沒有在跑的輪。
+    round: Option<RoundMeta>,
     buffer: Vec<u32>,
 }
 
@@ -170,10 +66,8 @@ impl LodState {
         Self {
             next_id: 1000,
             lod_trees: AHashMap::new(),
-            frontier: Frontier::new(),
-            output: Vec::new(),
-            touched: Vec::new(),
-            touched_set: AHashSet::new(),
+            core: TraverseCore::default(),
+            round: None,
             buffer: Vec::new(),
         }
     }
@@ -328,46 +222,6 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
     })
 }
 
-#[allow(dead_code)]
-struct LodInstance<'a> {
-    lod_id: u32,
-    splats: Ref<'a, Vec<LodSplat>>,
-    page_to_chunk: &'a [u32],
-    chunk_to_page: &'a [u32],
-    origin: Vec3A,
-    forward: Vec3A,
-    right: Vec3A,
-    up: Vec3A,
-    output: Vec<u32>,
-    lod_scale: f32,
-    outside_foveate: f32,
-    behind_foveate: f32,
-    cone_dot0: f32,
-    cone_dot: f32,
-    cone_foveate: f32,
-}
-
-#[allow(dead_code)]
-fn children_resident(child_count: u16, child_start: u32, instance: &LodInstance) -> bool {
-    // Check endpoints, okay since child_count <= 65535
-    for child in [child_start, child_start + child_count as u32 - 1] {
-        if !is_resident(child, instance) {
-            return false;
-        }
-    }
-    true
-}
-
-#[allow(dead_code)]
-fn is_resident(index: u32, instance: &LodInstance) -> bool {
-    let chunk = (index >> 16) as usize;
-    if chunk >= instance.chunk_to_page.len() {
-        false
-    } else {
-        instance.chunk_to_page[chunk] != 0xFFFFFFFF
-    }
-}
-
 #[wasm_bindgen]
 pub fn get_lod_tree_level(lod_id: u32, level: u32) -> anyhow::Result<Object, JsValue> {
     STATE.with_borrow_mut(|state| {
@@ -416,7 +270,22 @@ pub fn traverse_lod_trees(
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
 ) -> anyhow::Result<Object, JsValue> {
-    let max_splats = max_splats as usize;
+    traverse_lod_trees_sliced(
+        max_splats, pixel_scale_limit, _last_pixel_limit, lod_ids, root_pages, view_to_objects,
+        lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, 0.0, true,
+    )
+}
+
+/// 可續跑的 traverse。`budget_ms <= 0` = 原子(跑到底、清狀態,與 v2.1.0 逐位相同);
+/// `restart` = 丟掉現有 round 從 root 重開。設計見本專案 spec §4。
+fn traverse_lod_trees_sliced(
+    max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
+    lod_ids: &[u32], root_pages: &[u32],
+    view_to_objects: &[f32], lod_scales: &[f32],
+    behind_foveates: &[f32], cone_foveates: &[f32],
+    cone_fov0s: &[f32], cone_fovs: &[f32],
+    budget_ms: f32, restart: bool,
+) -> anyhow::Result<Object, JsValue> {
     let num_instances = lod_ids.len();
     if view_to_objects.len() != num_instances * 16 {
         return Err(JsValue::from_str("Invalid view_to_objects length"));
@@ -438,192 +307,121 @@ pub fn traverse_lod_trees(
     }
 
     STATE.with_borrow_mut(|state| {
-        let LodState { lod_trees, frontier, output, touched, touched_set, .. } = state;
-        let instances: Vec<_> = lod_ids.iter().enumerate().map(|(index, &lod_id)| {
-            let lod_tree = lod_trees.get(&lod_id).unwrap();
-            let LodTree { splats, page_to_chunk, chunk_to_page } = &lod_tree;
-            let i16 = index * 16;
-            let forward = Vec3A::from_slice(&view_to_objects[(i16 + 8)..(i16 + 11)]).normalize().map(|x| -x);
-            let origin = Vec3A::from_slice(&view_to_objects[(i16 + 12)..(i16 + 15)]);
-            let lod_scale = lod_scales[index];
-            let behind_foveate = behind_foveates[index];
-            let cone_foveate = cone_foveates[index];
-            let cone_dot0 = if cone_fov0s[index] > 0.0 { (0.5 * cone_fov0s[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
-            let cone_dot = if cone_fovs[index] > 0.0 { (0.5 * cone_fovs[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
-            let cone_dot = cone_dot.min(cone_dot0);
-            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot)
+        let LodState { lod_trees, core, round, .. } = state;
+        let atomic = budget_ms <= 0.0;
+        let fresh = is_fresh(atomic, restart, round.as_ref(), lod_ids);
+
+        if fresh {
+            let params: Vec<InstanceParams> = (0..num_instances).map(|index| {
+                let i16 = index * 16;
+                let forward = glam::Vec3A::from_slice(&view_to_objects[(i16 + 8)..(i16 + 11)]).normalize().map(|x| -x);
+                let origin = glam::Vec3A::from_slice(&view_to_objects[(i16 + 12)..(i16 + 15)]);
+                let cone_dot0 = if cone_fov0s[index] > 0.0 { (0.5 * cone_fov0s[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
+                let cone_dot = if cone_fovs[index] > 0.0 { (0.5 * cone_fovs[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
+                InstanceParams {
+                    origin,
+                    forward,
+                    lod_scale: lod_scales[index],
+                    behind_foveate: behind_foveates[index],
+                    cone_foveate: cone_foveates[index],
+                    cone_dot0,
+                    cone_dot: cone_dot.min(cone_dot0),
+                }
+            }).collect();
+            *round = Some(RoundMeta {
+                lod_ids: lod_ids.to_vec(),
+                params,
+                max_splats: max_splats as usize,
+                pixel_scale_limit,
+                slice: 0,
+                done: false,
+            });
+        }
+        let meta = round.as_mut().unwrap();
+
+        // 視圖用 **round 的姿態**(續跑不吃當幀相機),樹資料借 lod_trees 當下的(頁面更新可在兩片之間套用,spec §4.5)。
+        let borrows: Vec<Ref<Vec<LodSplat>>> = meta.lod_ids.iter()
+            .map(|id| lod_trees.get(id).unwrap().splats.borrow())
+            .collect();
+        let trees: Vec<TreeView> = meta.lod_ids.iter().enumerate().map(|(i, id)| TreeView {
+            lod_id: *id,
+            splats: &borrows[i],
+            chunk_to_page: &lod_trees.get(id).unwrap().chunk_to_page,
+            params: meta.params[i],
         }).collect();
 
-        let mut num_splats = 0;
-        frontier.clear();
-        output.clear();
-        output.reserve(max_splats);
-        touched.clear();
-        touched_set.clear();
-
-        for (inst_index, instance) in instances.iter().enumerate() {
-            let (lod_id, splats, ..) = instance;
-            let root_page = root_pages[inst_index];
-            let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
-            let root_index = root_page << 16;
-            let pixel_scale = compute_pixel_scale(&splats[root_index as usize], instance);
-            frontier.push((OrderedFloat(pixel_scale), inst_index as u32, root_index));
-            num_splats += 1;
-
-            if touched_set.insert((*lod_id, 0)) {
-                touched.push((*lod_id, 0));
-            }
-        }
-        
-        let mut min_pixel_scale = f32::INFINITY;
-        let mut leaf_count = 0;
-
-        while let Some(&(OrderedFloat(pixel_scale), inst_index, paged_index)) = frontier.peek() {
-            min_pixel_scale = min_pixel_scale.min(pixel_scale);
-            if pixel_scale <= pixel_scale_limit {
-                break;
-            }
-
-            let instance = &instances[inst_index as usize];
-            let (lod_id, splats, _page_to_chunk, chunk_to_page, ..) = instance;
-            let LodSplat { child_count, child_start, .. } = splats[paged_index as usize];
-
-            if child_count == 0 {
-                _ = frontier.pop();
-                output.push((inst_index, paged_index));
-                leaf_count += 1;
-                continue;
-            }
-
-            let new_num_splats = num_splats - 1 + child_count as usize;
-            if new_num_splats > max_splats {
-                break;
-            }
-
-            _ = frontier.pop();
-
-            let first_chunk = child_start >> 16;
-            if touched_set.insert((*lod_id, first_chunk)) {
-                touched.push((*lod_id, first_chunk));
-            }
-
-            let last_chunk = (child_start + child_count as u32 - 1) >> 16;
-            if last_chunk != first_chunk && touched_set.insert((*lod_id, last_chunk)) {
-                touched.push((*lod_id, last_chunk));
-            }
-
-            if last_chunk as usize >= chunk_to_page.len() {
-                output.push((inst_index, paged_index));
-                continue;
-            }
-            let first_page = chunk_to_page[first_chunk as usize];
-            let last_page = chunk_to_page[last_chunk as usize];
-
-            if first_page == 0xFFFFFFFF || last_page == 0xFFFFFFFF {
-                output.push((inst_index, paged_index));
-                continue;
-            }
-
-            for child in child_start..child_start + child_count as u32 {
-                let child_chunk = (child >> 16) as usize;
-                let child_page = chunk_to_page[child_chunk];
-                let paged_index = (child_page << 16) | (child & 0xffff);
-                let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
-                if pixel_scale <= pixel_scale_limit {
-                    output.push((inst_index, paged_index));
-                } else {
-                    frontier.push((OrderedFloat(pixel_scale), inst_index, paged_index));
-                }
-            }
-
-            num_splats = new_num_splats;
+        if fresh {
+            core.reset(meta.max_splats);
+            seed_roots(core, &trees, root_pages);
         }
 
-        let output_size = output.len();
-        let frontier_size = frontier.len();
+        // 每 4096 次 pop 才查一次時間(spec D4):跨 wasm→JS 邊界的 Date::now() 不能每個節點都叫。
+        let t0 = js_sys::Date::now();
+        let deadline = if atomic { None } else { Some(t0 + budget_ms as f64) };
+        let mut pops = 0u32;
+        let exit = expand_until(core, &trees, meta.max_splats, meta.pixel_scale_limit, &mut || {
+            pops = pops.wrapping_add(1);
+            pops & 4095 == 0 && deadline.is_some_and(|d| js_sys::Date::now() >= d)
+        });
+        meta.slice += 1;
+        meta.done = exit == LoopExit::Done;
+        let slice_ms = js_sys::Date::now() - t0;
 
-        for (_, inst_index, paged_index) in frontier.drain() {
-            output.push((inst_index, paged_index));
-        }
+        let output_size = core.output.len();
+        let frontier_size = core.frontier.len();
+        // 快照 = output ∪ frontier,不 drain(spec D3)。
+        let cut = core.snapshot();
 
-        let mut instance_counts = Vec::new();
-        instance_counts.resize(num_instances, 0);
-        for &(inst_index, _) in output.iter() {
+        let mut instance_counts = vec![0usize; num_instances];
+        for &(inst_index, _) in cut.iter() {
             instance_counts[inst_index as usize] += 1;
         }
-
-        let mut instance_outputs = Vec::with_capacity(num_instances);
-        for counts in instance_counts {
-            instance_outputs.push(Vec::with_capacity(counts));
-        }
-
-        for &(inst_index, paged_index) in output.iter() {
+        let mut instance_outputs: Vec<Vec<u32>> = instance_counts.iter().map(|&n| Vec::with_capacity(n)).collect();
+        for &(inst_index, paged_index) in cut.iter() {
             instance_outputs[inst_index as usize].push(paged_index);
         }
 
         let instance_indices = Array::new();
-
-        for (inst_index, instance_output) in instance_outputs.iter_mut().enumerate() {
-            // instance_output.sort_unstable();
+        for (inst_index, instance_output) in instance_outputs.iter().enumerate() {
             let rows = instance_output.len().div_ceil(16384);
             let capacity = rows * 16384;
             let output = Uint32Array::new_with_length(capacity as u32);
-            output.subarray(0, instance_output.len() as u32).copy_from(&instance_output);
+            output.subarray(0, instance_output.len() as u32).copy_from(instance_output);
 
             let result = Object::new();
-            let lod_id = instances[inst_index].0;
-            Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(lod_id)).unwrap();
+            Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(meta.lod_ids[inst_index])).unwrap();
             Reflect::set(&result, &JsValue::from_str("numSplats"), &JsValue::from(instance_output.len() as u32)).unwrap();
             Reflect::set(&result, &JsValue::from_str("indices"), &JsValue::from(output)).unwrap();
             instance_indices.push(&JsValue::from(result));
         }
 
+        // chunks = 本輪**累計**的 touched(不是這片新增的)—— 這是 pager 不釋放 cut 所用頁的前提(spec §4.5)。
         let out_chunks = Array::new();
-
-        for &(inst_index, chunk) in touched.iter() {
+        for &(inst_index, chunk) in core.touched.iter() {
             let pair = Array::new();
             pair.push(&JsValue::from(inst_index));
             pair.push(&JsValue::from(chunk));
             out_chunks.push(&JsValue::from(pair));
         }
 
+        let done = meta.done;
+        let slice = meta.slice;
         let result = Object::new();
-        Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(min_pixel_scale)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(core.min_pixel_scale)).unwrap();
         Reflect::set(&result, &JsValue::from_str("instanceIndices"), &JsValue::from(instance_indices)).unwrap();
         Reflect::set(&result, &JsValue::from_str("chunks"), &JsValue::from(out_chunks)).unwrap();
         Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(output_size)).unwrap();
         Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(frontier_size)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(leaf_count)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(core.leaf_count)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("done"), &JsValue::from(done)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("slice"), &JsValue::from(slice)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("sliceMs"), &JsValue::from(slice_ms)).unwrap();
+
+        drop(trees);
+        drop(borrows);
+        if atomic {
+            *round = None;
+        }
         Ok(result)
     })
-}
-
-fn compute_pixel_scale<'a>(
-    splat: &LodSplat,
-    instance: &(u32, Ref<'a, Vec<LodSplat>>, &Vec<u32>, &Vec<u32>, Vec3A, Vec3A, f32, f32, f32, f32, f32),
-) -> f32 {
-    let &(_, _, _, _, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot) = instance;
-    let center = splat.center();
-    let delta = center - origin;
-    let distance = delta.length().max(1.0e-6);
-    let inv_distance = 1.0 / distance;
-    let pixel_scale = splat.size() * inv_distance;
-    let pixel_scale = pixel_scale * lod_scale;
-
-    let forward_dot = delta.dot(forward);
-    let foveate = if forward_dot <= 0.0 {
-        behind_foveate
-    } else {
-        let dot = forward_dot * inv_distance;
-        if dot >= cone_dot0 {
-            1.0
-        } else if dot >= cone_dot {
-            let t = (dot - cone_dot) / (cone_dot0 - cone_dot);
-            cone_foveate + (1.0 - cone_foveate) * t
-        } else {
-            let t = dot / cone_dot;
-            behind_foveate + (cone_foveate - behind_foveate) * t
-        }
-    };
-    foveate * pixel_scale
 }
