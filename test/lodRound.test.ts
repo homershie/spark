@@ -3,6 +3,7 @@ import {
   LOD_SLICE_MAX_MS,
   canAbortRound,
   newLodRound,
+  shouldApplySlice,
   sliceBudget,
 } from "../src/lodRound.js";
 
@@ -58,5 +59,37 @@ assert.deepStrictEqual(r, {
   fetchersAtStart: 3,
 });
 assert.strictEqual(newLodRound(0, "init").fetchersAtStart, 0, "沒給就 0");
+
+// shouldApplySlice:done / 原子 / 關掉規則一律套;否則顆數要 ≥ fraction × 上次套的
+assert.strictEqual(
+  shouldApplySlice(true, 40, 0.5, 10, 1000),
+  true,
+  "done 一律套",
+);
+assert.strictEqual(
+  shouldApplySlice(false, 0, 0.5, 10, 1000),
+  true,
+  "budget 0(原子)一律套",
+);
+assert.strictEqual(
+  shouldApplySlice(false, 40, 0, 10, 1000),
+  true,
+  "fraction 0 = 規則關,一律套",
+);
+assert.strictEqual(
+  shouldApplySlice(false, 40, 0.5, 499, 1000),
+  false,
+  "499 < 500 → 不套",
+);
+assert.strictEqual(
+  shouldApplySlice(false, 40, 0.5, 500, 1000),
+  true,
+  "剛好 500 → 套",
+);
+assert.strictEqual(
+  shouldApplySlice(false, 40, 0.5, 1, 0),
+  true,
+  "螢幕上還沒有 cut(0)→ 任何片都套",
+);
 
 console.log("✅ lodRound tests passed!");

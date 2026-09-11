@@ -9826,6 +9826,10 @@ function canAbortRound(round2, now, holdMs) {
   if (!round2 || round2.done) return true;
   return round2.applied > 0 && now - round2.startedAt >= holdMs;
 }
+function shouldApplySlice(done, budgetMs, fraction, totalSplats, lastAppliedSplats) {
+  if (done || budgetMs <= 0 || fraction <= 0) return true;
+  return totalSplats >= fraction * lastAppliedSplats;
+}
 function newLodRound(now, cause, fetchersAtStart = 0) {
   return {
     startedAt: now,
@@ -9879,6 +9883,8 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.sortedCenter = new THREE__namespace.Vector3().setScalar(Number.NEGATIVE_INFINITY);
     this.sortedDir = new THREE__namespace.Vector3().setScalar(0);
     this.readback32 = new Uint32Array(0);
+    this.lastAppliedSplats = 0;
+    this.lastAppliedChunks = [];
     this.lodRound = null;
     this.lodTreeDirty = false;
     this.lodRoundSeq = 0;
@@ -9954,6 +9960,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.lodSliceMs = options.lodSliceMs ?? 40;
     this.lodFirstSliceMs = options.lodFirstSliceMs ?? 0;
     this.lodHoldMs = options.lodHoldMs ?? 0;
+    this.lodApplyMinFraction = options.lodApplyMinFraction ?? 0.5;
     this.lodInflate = options.lodInflate ?? false;
     this.pagedExtSplats = options.pagedExtSplats ?? false;
     const defaultPages = isMobile() ? isIos() ? 96 : 128 : 256;
@@ -10627,7 +10634,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       if (this.lodRound && !this.lodRound.done) {
         const round2 = this.lodRound;
         const budgetMs = round2.cause === "tree" ? 0 : sliceBudget(round2.slice, this.lodSliceMs, this.lodFirstSliceMs);
-        const { done } = await this.updateLodInstances(
+        const { done, applied } = await this.updateLodInstances(
           worker,
           this.lodDeltaPred,
           lodMeshes,
@@ -10639,9 +10646,11 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         );
         round2.restart = false;
         round2.slice += 1;
-        round2.applied += 1;
-        if (round2.applied === 1) {
-          round2.firstApplyMs = performance.now() - round2.startedAt;
+        if (applied) {
+          round2.applied += 1;
+          if (round2.applied === 1) {
+            round2.firstApplyMs = performance.now() - round2.startedAt;
+          }
         }
         round2.done = done;
         if (done) {
@@ -10732,7 +10741,18 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       (sum, { numSplats }) => sum + numSplats,
       0
     );
-    this.updateLodIndices(uuidToMesh, keyIndices);
+    const apply = shouldApplySlice(
+      done,
+      slice.budgetMs,
+      this.lodApplyMinFraction,
+      totalLodSplats,
+      this.lastAppliedSplats
+    );
+    if (apply) {
+      this.updateLodIndices(uuidToMesh, keyIndices);
+      this.lastAppliedSplats = totalLodSplats;
+      this.lastAppliedChunks = chunks;
+    }
     if (this.pager) {
       this.pager.processUploads();
       const pagedMeshes = lodMeshes.map((mesh) => {
@@ -10756,11 +10776,18 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         splats,
         chunk: 0
       }));
-      for (const [lodId, chunk] of chunks) {
-        const splats = this.lodIdToSplats.get(lodId);
-        if (splats instanceof PagedSplats) {
-          if (chunk !== 0) {
-            this.pager.fetchPriority.push({ splats, chunk });
+      const seen = /* @__PURE__ */ new Set();
+      const lists = apply ? [chunks] : [chunks, this.lastAppliedChunks];
+      for (const list of lists) {
+        for (const [lodId, chunk] of list) {
+          const key = lodId * 2 ** 20 + chunk;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const splats = this.lodIdToSplats.get(lodId);
+          if (splats instanceof PagedSplats) {
+            if (chunk !== 0) {
+              this.pager.fetchPriority.push({ splats, chunk });
+            }
           }
         }
       }
@@ -10792,7 +10819,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         mesh.raycastIndices = countIndices;
       }
     }
-    return { done };
+    return { done, applied: apply };
   }
   /** 一輪結束(完成或被姿態變動中止):記讀數、推進 lodRoundSeq。 */
   finishLodRound(round2, aborted) {
@@ -10800,6 +10827,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       firstApplyMs: round2.firstApplyMs,
       totalMs: performance.now() - round2.startedAt,
       slices: round2.slice,
+      applied: round2.applied,
       aborted,
       cause: round2.cause,
       fetchersAtStart: round2.fetchersAtStart

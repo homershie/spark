@@ -193,6 +193,13 @@ export interface SparkRendererOptions {
      */
     lodHoldMs?: number;
     /**
+     * 「不可見的降級」規則:pose/init 輪的中間片只有在「這片的總顆數 ≥ lodApplyMinFraction ×
+     * 螢幕上現有 cut 的總顆數」時才套用;`done` 的那片一律套用;tree 輪(原子)一律套用。
+     * 0 = 每片都套(走路時每輪只活一片 → 永遠是最粗的 cut)。
+     * @default 0.5
+     */
+    lodApplyMinFraction?: number;
+    /**
      * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
      * @default false
      */
@@ -368,6 +375,11 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodSliceMs: number;
     lodFirstSliceMs: number;
     lodHoldMs: number;
+    lodApplyMinFraction: number;
+    /** 最後一份**真的套到 GPU** 的 cut 的總顆數(shouldApplySlice 的分母)。 */
+    private lastAppliedSplats;
+    /** 那份 cut 回來時的 chunks —— 沒套用的片要把它接在 fetchPriority 後面,螢幕上的頁才不會被 pager 釋放(spec §4.5)。 */
+    private lastAppliedChunks;
     /** 目前在跑的 round;null = 沒有。cause=pose/init 切片跑;cause=tree 原子一次跑完(相機沒動不閃粗版)。 */
     lodRound: LodRound | null;
     /** 頁面更新到了、但要等這輪跑完再補一輪(見 lodRound.ts / driveLod);補的那輪走原子,不切片。 */

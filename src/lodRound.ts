@@ -34,6 +34,8 @@ export type LodRoundStats = {
   firstApplyMs: number;
   totalMs: number;
   slices: number;
+  /** 幾片真的套到 GPU(`shouldApplySlice` 放行的)。 */
+  applied: number;
   aborted: boolean;
   cause: LodRoundCause;
   fetchersAtStart: number;
@@ -58,6 +60,9 @@ export function sliceBudget(
  * 姿態變了,現在這輪能不能丟掉重開。
  * 底線:**至少套用過一片**才能被中止 —— 否則 `firstMs` 大於姿態變髒的間隔時,
  * 永遠沒有一片套得上、畫面凍在舊 cut。`holdMs` 是額外的最短存活時間。
+ * ⚠️ `applied` 只算**真的套到 GPU** 的片(見 `shouldApplySlice`):`lodApplyMinFraction > 0`
+ * 之下,走路中的輪會一直跑到顆數達標(或 done)才套第一片、才能被下一個姿態接手 ——
+ * 這是刻意的,期間螢幕保留上一份細 cut,而不是每輪都閃一次粗版。
  */
 export function canAbortRound(
   round: LodRound | null,
@@ -66,6 +71,23 @@ export function canAbortRound(
 ): boolean {
   if (!round || round.done) return true;
   return round.applied > 0 && now - round.startedAt >= holdMs;
+}
+
+/**
+ * 這一片要不要套到 GPU(「不可見的降級」規則)。
+ * 跑完的那片、原子(`budgetMs <= 0`)、關掉規則(`fraction <= 0`)一律套;
+ * 否則只有這片的總顆數 ≥ `fraction × 螢幕上現有 cut 的總顆數` 才套 —— 走路時每輪從 root 重開,
+ * 第一片只有 ~粗 cut 的顆數,直接套上去就是「永遠糊」;不套則螢幕保留上一份細 cut,直到新輪追上。
+ */
+export function shouldApplySlice(
+  done: boolean,
+  budgetMs: number,
+  fraction: number,
+  totalSplats: number,
+  lastAppliedSplats: number,
+): boolean {
+  if (done || budgetMs <= 0 || fraction <= 0) return true;
+  return totalSplats >= fraction * lastAppliedSplats;
 }
 
 export function newLodRound(
