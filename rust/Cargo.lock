@@ -1158,6 +1158,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "traverse-bench"
+version = "0.1.0"
+dependencies = [
+ "ahash 0.8.12",
+ "glam",
+ "half",
+ "ordered-float",
+]
+
+[[package]]
 name = "typed-path"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

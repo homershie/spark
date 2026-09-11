@@ -17,6 +17,7 @@ mod decoder;
 mod packed_splats;
 mod ext_splats;
 
+mod lod_splat;
 mod lod_tree;
 mod lod_traverse;
 #[cfg(test)]

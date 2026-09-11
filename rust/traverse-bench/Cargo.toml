@@ -1,0 +1,21 @@
+[package]
+name = "traverse-bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# LoD traverse 的基準,原生與 wasm32-wasip1 跑同一份程式(`#[path]` include worker crate 的
+# lod_splat / lod_traverse / lod_synth)。存在的理由:原生 M1 有 f16 硬體轉換、wasm 沒有,
+# 原生量到 0% 的項目在 wasm 上不一定是 0%;而瀏覽器量一次要使用者走 30 秒。
+# 跑法見 rust/traverse-bench/run.sh。
+
+[[bin]]
+name = "traverse-bench"
+path = "src/main.rs"
+
+[dependencies]
+ahash.workspace = true
+glam.workspace = true
+half.workspace = true
+ordered-float.workspace = true

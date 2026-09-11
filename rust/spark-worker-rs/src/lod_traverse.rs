@@ -12,7 +12,7 @@ use std::collections::BinaryHeap;
 use ahash::AHashSet;
 use glam::Vec3A;
 
-use crate::lod_tree::LodSplat;
+use crate::lod_splat::LodSplat;
 
 /// `chunk_to_page` 裡「這個 chunk 不在 GPU」的標記(與 lod_tree.rs 的 0xFFFFFFFF 同值)。
 pub(crate) const NOT_RESIDENT: u32 = 0xFFFF_FFFF;

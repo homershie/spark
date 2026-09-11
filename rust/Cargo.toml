@@ -4,6 +4,7 @@ members = [
     "spark-worker-rs",
     "spark-rs",
     "spark-lib",
+    "traverse-bench",
 ]
 resolver = "2"
 

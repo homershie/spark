@@ -1,6 +1,6 @@
 //! 合成一棵像 `.rad` 的 LoD 樹,給 `lod_traverse` 的原生基準與「改前 == 改後」集合測試用。
 //!
-//! 只在 `cfg(test)` 下編譯。存在的理由(方案 C,2026-09-11):微優化要「每項單獨量」,
+//! worker crate 只在 `cfg(test)` 下編譯它;`rust/traverse-bench` 用 `#[path]` include 同一份跑 wasm。存在的理由(方案 C,2026-09-11):微優化要「每項單獨量」,
 //! 但瀏覽器裡量一次 = 使用者走 30 秒;這裡的原生數字不等於 wasm,**相對差距**卻可信,
 //! 而且能為假 —— 原生沒差的項目直接不做。集合相等靠 `cut_hash` 釘在測試裡的常數。
 //!
@@ -14,7 +14,7 @@ use glam::{Vec3, Vec3A};
 use crate::lod_traverse::{
     limit_key, expand_until, seed_roots, InstanceParams, TraverseCore, TreeView,
 };
-use crate::lod_tree::LodSplat;
+use crate::lod_splat::LodSplat;
 
 pub(crate) const CHUNK: usize = 65536;
 
@@ -162,16 +162,48 @@ pub(crate) fn assert_valid_cut(tree: &SynthTree, chunk_to_page: &[u32], cut_page
     }
 }
 
+const POSES: [(Vec3A, Vec3A); 3] = [
+    (Vec3A::new(10.0, 2.0, -30.0), Vec3A::new(0.2, 0.0, 1.0)),
+    (Vec3A::new(-40.0, 1.5, 12.0), Vec3A::new(1.0, 0.0, -0.3)),
+    (Vec3A::new(3.0, 30.0, 3.0), Vec3A::new(0.0, -1.0, 0.1)),
+];
+
+/// 基準本體:256 頁 × 65536 = 16.7M 節點(= 桌機 page 池的容量,`splats` 陣列 268MB,隨機存取的
+/// cache 行為才像真的)、預算 2.5M(將軍府桌機走路階段的飽和情境)、三個姿態、取 `rounds` 次的最小值。
+/// 原生與 wasm32-wasip1 跑同一份(`rust/traverse-bench`)。
+pub(crate) fn bench_main(rounds: usize) {
+    use std::time::Instant;
+    let t = Instant::now();
+    let tree = build_synth(7, 256 * CHUNK, 256.0);
+    let (splats, c2p, root_page) = page_out(&tree);
+    eprintln!(
+        "synth: {} nodes, {} chunks, built in {:?}",
+        tree.nodes.len(), tree.num_chunks, t.elapsed()
+    );
+    let mut best = [f64::INFINITY; 3];
+    for round in 0..rounds {
+        for (k, &(origin, forward)) in POSES.iter().enumerate() {
+            let p = params(origin, forward);
+            let t = Instant::now();
+            let (cut, n) = run_atomic(&splats, &c2p, root_page, p, 2_500_000);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            best[k] = best[k].min(ms);
+            eprintln!(
+                "round {round} pose {k}: {ms:7.1} ms  cut {n}  hash {:#018x}",
+                cut_hash(&cut)
+            );
+        }
+    }
+    // 取最小值:量的是演算法成本,不是這台機器當下的雜訊
+    eprintln!(
+        "MIN of {rounds}: pose0 {:.1} ms  pose1 {:.1} ms  pose2 {:.1} ms  sum {:.1} ms",
+        best[0], best[1], best[2], best.iter().sum::<f64>()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
-
-    const POSES: [(Vec3A, Vec3A); 3] = [
-        (Vec3A::new(10.0, 2.0, -30.0), Vec3A::new(0.2, 0.0, 1.0)),
-        (Vec3A::new(-40.0, 1.5, 12.0), Vec3A::new(1.0, 0.0, -0.3)),
-        (Vec3A::new(3.0, 30.0, 3.0), Vec3A::new(0.0, -1.0, 0.1)),
-    ];
 
     /// 小樹(~300k 節點、預算 100k)在 debug 下也跑得動:每個姿態的 cut 指紋釘死。
     /// **改迴圈的任何一項,這三個常數都不能動**(動了 = 集合變了 = 那不是微優化)。
@@ -197,38 +229,11 @@ mod tests {
         }
     }
 
-    /// 原生基準:`cargo test --release --lib bench_synth -- --ignored --nocapture`。
-    /// 256 頁 × 65536 = 16.7M 節點(= 桌機 page 池的容量,`splats` 陣列 268MB,隨機存取的 cache
-    /// 行為才像真的)、預算 2.5M(將軍府桌機走路階段的飽和情境)。印每姿態的 ms 與 cut 指紋。
+    /// 原生基準:`cargo test --release --lib bench_synth -- --ignored --nocapture`;
+    /// wasm 基準走 `rust/traverse-bench`(同一份 `bench_main`)。
     #[test]
     #[ignore]
     fn bench_synth_traverse() {
-        let t = Instant::now();
-        let tree = build_synth(7, 256 * CHUNK, 256.0);
-        let (splats, c2p, root_page) = page_out(&tree);
-        eprintln!(
-            "synth: {} nodes, {} chunks, built in {:?}",
-            tree.nodes.len(), tree.num_chunks, t.elapsed()
-        );
-        let rounds = 5;
-        let mut best = [f64::INFINITY; 3];
-        for round in 0..rounds {
-            for (k, &(origin, forward)) in POSES.iter().enumerate() {
-                let p = params(origin, forward);
-                let t = Instant::now();
-                let (cut, n) = run_atomic(&splats, &c2p, root_page, p, 2_500_000);
-                let ms = t.elapsed().as_secs_f64() * 1e3;
-                best[k] = best[k].min(ms);
-                eprintln!(
-                    "round {round} pose {k}: {ms:7.1} ms  cut {n}  hash {:#018x}",
-                    cut_hash(&cut)
-                );
-            }
-        }
-        // 取最小值:量的是演算法成本,不是這台機器當下的雜訊
-        eprintln!(
-            "MIN of {rounds}: pose0 {:.1} ms  pose1 {:.1} ms  pose2 {:.1} ms  sum {:.1} ms",
-            best[0], best[1], best[2], best.iter().sum::<f64>()
-        );
+        bench_main(5);
     }
 }
