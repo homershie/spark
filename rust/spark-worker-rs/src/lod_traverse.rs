@@ -271,7 +271,9 @@ pub(crate) fn compute_pixel_scale(splat: &LodSplat, p: &InstanceParams) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahash::AHashMap;
     use glam::Vec3;
+    use ordered_float::OrderedFloat;
 
     const LOD_ID: u32 = 7;
     const LEAF_FIRST: u32 = 21;
@@ -504,7 +506,6 @@ mod tests {
     /// u64 打包的排序必須與原本的 `(OrderedFloat<f32>, u32, u32)` 逐位相同 —— 這是「集合不變」的前提。
     #[test]
     fn packed_entry_orders_like_the_old_tuple() {
-        use ordered_float::OrderedFloat;
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = move || {
             seed ^= seed << 13;
@@ -539,6 +540,246 @@ mod tests {
         assert!(Entry::new(f32::INFINITY, 0, 0) > Entry::new(f32::MAX, 127, MAX_PAGED_INDEX as u32 - 1));
         let e = Entry::new(0.5, 127, MAX_PAGED_INDEX as u32 - 1);
         assert_eq!((e.key(), e.inst(), e.paged()), (0.5, 127, MAX_PAGED_INDEX as u32 - 1));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 方案 B(真增量)可行性試作(handoff「先做的一件事」)。
+    //
+    // 要證的一件事:**只在展開節點時順手記 parent**(不改 `.rad`、不建整棵樹的表),
+    // 姿態變了之後拿現有 cut 做「太粗的拆、parent 已經夠細的收回」,結果等於用新姿態
+    // 從 root 原子跑出來的 cut。
+    //
+    // 兩個設計上的細節,測試就是為了逼出它們:
+    // 1. 收回的判準是「**parent 的 pixel_scale ≤ limit**」,不是「整組兄弟都 ≤ limit」——
+    //    原子 traverse 展開一個節點的條件就是它自己的 ps > limit,與孩子各自多大無關
+    //    (ps 沿樹不嚴格單調:子節點可以比父節點更靠近相機)。
+    // 2. 收回可以連跳兩層以上(葉 → 中層 → 上層),所以 parent 要記在**每一個展開過的
+    //    節點**上(`parent_of`),不只 cut 那一筆 —— 中層節點正是我們自己展開出來的,
+    //    展開當下就知道它的 parent。
+    //
+    // 這裡是試作,單 instance、單 chunk、不管 residency / 預算再平衡的細節;
+    // 正式的資料結構由 spec 決定。
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const NONE: u32 = u32::MAX;
+
+    /// 帶 parent 的 cut。`cut` 的每筆 = (paged_index, parent);`parent_of` = 每個
+    /// **展開過**(interior)的節點的 parent。
+    #[derive(Debug, Default, Clone)]
+    struct ParentedCut {
+        cut: Vec<(u32, u32)>,
+        parent_of: AHashMap<u32, u32>,
+    }
+
+    impl ParentedCut {
+        fn nodes(&self) -> Vec<u32> {
+            let mut v: Vec<u32> = self.cut.iter().map(|&(n, _)| n).collect();
+            v.sort_unstable();
+            v
+        }
+    }
+
+    /// 從 root 原子展開(best-first,與 `expand_until` 同語意),但每展開一個節點就記
+    /// `parent_of[child] = node`。等同「今天的 traverse + 順手記 parent」。
+    fn expand_recording(splats: &[LodSplat], p: &InstanceParams, limit: f32, max: usize) -> ParentedCut {
+        let mut heap: BinaryHeap<(OrderedFloat<f32>, u32, u32)> = BinaryHeap::new();
+        let mut out = ParentedCut::default();
+        let mut n = 1usize;
+        heap.push((OrderedFloat(compute_pixel_scale(&splats[0], p)), 0, NONE));
+        while let Some(&(OrderedFloat(ps), node, parent)) = heap.peek() {
+            if ps <= limit {
+                break;
+            }
+            let LodSplat { child_count, child_start, .. } = splats[node as usize];
+            if child_count == 0 {
+                heap.pop();
+                out.cut.push((node, parent));
+                continue;
+            }
+            if n - 1 + child_count as usize > max {
+                break;
+            }
+            heap.pop();
+            out.parent_of.insert(node, parent);
+            for c in child_start..child_start + child_count as u32 {
+                heap.push((OrderedFloat(compute_pixel_scale(&splats[c as usize], p)), c, node));
+            }
+            n = n - 1 + child_count as usize;
+        }
+        out.cut.extend(heap.into_iter().map(|(_, node, parent)| (node, parent)));
+        out
+    }
+
+    /// 姿態變了:在現有 cut 上做局部收回 / 展開,不從 root 重來。
+    ///
+    /// 1. 限制收回:interior 節點 P 的 ps ≤ limit 且**它的孩子全部直接在 cut 裡** → 收回成 P。
+    ///    反覆做到沒有為止(收回後 P 進 cut,P 的 parent 可能接著符合)。
+    /// 2. 預算收回:|cut| > max → 從 ps 最小的「孩子全在 cut」的 interior 開始收,收到 ≤ max。
+    /// 3. 展開:cut 內 ps > limit 且有孩子的節點,依 ps 由大到小展開、裝得下才展(= 原子的
+    ///    greedy 停法);展開出來的孩子照樣進 heap。
+    fn rebalance(inc: &mut ParentedCut, splats: &[LodSplat], p: &InstanceParams, limit: f32, max: usize) {
+        let ps = |n: u32| compute_pixel_scale(&splats[n as usize], p);
+
+        // 「孩子全在 cut」的 interior 集合:cut 內以 P 為 parent 的筆數 == P 的 child_count
+        let complete_groups = |inc: &ParentedCut| -> Vec<u32> {
+            let mut count: AHashMap<u32, u16> = AHashMap::new();
+            for &(_, parent) in &inc.cut {
+                if parent != NONE {
+                    *count.entry(parent).or_default() += 1;
+                }
+            }
+            count.into_iter()
+                .filter(|&(parent, c)| c == splats[parent as usize].child_count)
+                .map(|(parent, _)| parent)
+                .collect()
+        };
+        let collapse = |inc: &mut ParentedCut, parent: u32| {
+            inc.cut.retain(|&(_, pp)| pp != parent);
+            let grand = inc.parent_of.remove(&parent).expect("interior 節點必有記錄的 parent");
+            inc.cut.push((parent, grand));
+        };
+
+        // 1. 限制收回(到不動點)
+        loop {
+            let victims: Vec<u32> = complete_groups(inc).into_iter().filter(|&g| ps(g) <= limit).collect();
+            if victims.is_empty() {
+                break;
+            }
+            for g in victims {
+                collapse(inc, g);
+            }
+        }
+        // 2. 預算收回(從 ps 最小的完整組開始)
+        while inc.cut.len() > max {
+            let mut groups = complete_groups(inc);
+            groups.sort_by_key(|&g| OrderedFloat(ps(g)));
+            let g = *groups.first().expect("超過預算卻沒有可收的組");
+            collapse(inc, g);
+        }
+        // 3. 展開(best-first,greedy)
+        let mut heap: BinaryHeap<(OrderedFloat<f32>, u32, u32)> = inc.cut.iter()
+            .filter(|&&(n, _)| splats[n as usize].child_count > 0)
+            .map(|&(n, parent)| (OrderedFloat(ps(n)), n, parent))
+            .filter(|&(OrderedFloat(s), _, _)| s > limit)
+            .collect();
+        let mut n = inc.cut.len();
+        while let Some(&(_, node, parent)) = heap.peek() {
+            let LodSplat { child_count, child_start, .. } = splats[node as usize];
+            if n - 1 + child_count as usize > max {
+                break;
+            }
+            heap.pop();
+            inc.cut.retain(|&(m, _)| m != node);
+            inc.parent_of.insert(node, parent);
+            for c in child_start..child_start + child_count as u32 {
+                inc.cut.push((c, node));
+                let s = ps(c);
+                if s > limit && splats[c as usize].child_count > 0 {
+                    heap.push((OrderedFloat(s), c, node));
+                }
+            }
+            n = n - 1 + child_count as usize;
+        }
+    }
+
+    fn pose(origin: Vec3A) -> InstanceParams {
+        InstanceParams { origin, ..params() }
+    }
+
+    /// interior 的 parent 記錄必須與 cut 自洽:cut 每筆的 parent(非 root)都在 `parent_of`,
+    /// 且沿 parent 鏈走得到 root。
+    fn assert_parent_chain(inc: &ParentedCut, truth: &[u32]) {
+        for &(node, parent) in &inc.cut {
+            assert_eq!(parent, truth[node as usize], "節點 {node} 記錄的 parent 錯");
+            let mut p = parent;
+            while p != NONE {
+                assert_eq!(inc.parent_of.get(&p).copied(), Some(truth[p as usize]), "interior {p} 的 parent 記錄缺或錯");
+                p = truth[p as usize];
+            }
+        }
+    }
+
+    /// 樹的 ps(z = -50):root .16 / L1 .08 / L2 .04 / 葉 .02。limit 0.03:
+    ///   z=-50  → 展開到 L2(.04 > .03)→ cut = 64 葉
+    ///   z=-100 → root .08 / L1 .04 / L2 .02 → cut = 16 個 L2
+    ///   z=-150 → root .053 / L1 .027 → cut = 4 個 L1(要從葉連收兩層)
+    #[test]
+    fn incremental_coarsen_two_levels_equals_atomic() {
+        let (splats, truth) = build_tree();
+        let limit = 0.03;
+        let near = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let far = pose(Vec3A::new(0.0, 0.0, -150.0));
+
+        let mut inc = expand_recording(&splats, &near, limit, 1000);
+        assert_eq!(inc.nodes(), (LEAF_FIRST..=LEAF_LAST).collect::<Vec<_>>());
+        assert_parent_chain(&inc, &truth);
+
+        rebalance(&mut inc, &splats, &far, limit, 1000);
+        let atomic = expand_recording(&splats, &far, limit, 1000);
+        assert_eq!(inc.nodes(), vec![1, 2, 3, 4], "拉遠後應收回到 L1");
+        assert_eq!(inc.nodes(), atomic.nodes());
+        assert_parent_chain(&inc, &truth);
+        assert_valid_cut(&inc.cut.iter().map(|&(n, _)| (0, n)).collect::<Vec<_>>(), &truth);
+    }
+
+    /// 混合 cut:limit 0.03999 卡在 z=-100 時 L1 的 ps(4/√(x²+100²),x=1..4 → .039998/.039992/
+    /// .039982/.039968)中間 —— 節點 1、2 展開、3、4 不展;相機 x 偏到 5 則反過來(4、3 展)。
+    /// 所以同一層「有的拆、有的收」,連同拉近(全葉)/ 拉遠(全 L1)串成一條鏈,每站都要等於原子。
+    #[test]
+    fn incremental_refine_and_mixed_chain_equals_atomic() {
+        let (splats, truth) = build_tree();
+        let limit = 0.03999;
+        let chain = [
+            Vec3A::new(0.0, 0.0, -100.0), // 混合:1、2 展
+            Vec3A::new(0.0, 0.0, -50.0),  // 全葉
+            Vec3A::new(5.0, 0.0, -100.0), // 混合:4、3 展(從全葉收成混合)
+            Vec3A::new(0.0, 0.0, -150.0), // 全 L1
+            Vec3A::new(0.0, 0.0, -100.0), // 混合:1、2 展(從 L1 拆成混合)
+            Vec3A::new(5.0, 0.0, -100.0), // 混合 → 另一種混合(同時有拆有收)
+            Vec3A::new(0.0, 0.0, -50.0),  // 全葉
+        ];
+        let mut inc = expand_recording(&splats, &pose(chain[0]), limit, 1000);
+        assert_eq!(inc.nodes(), vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12], "起點應是混合 cut");
+        let mut distinct = AHashSet::new();
+        distinct.insert(inc.nodes());
+        for &origin in &chain[1..] {
+            let p = pose(origin);
+            rebalance(&mut inc, &splats, &p, limit, 1000);
+            let atomic = expand_recording(&splats, &p, limit, 1000);
+            assert_eq!(inc.nodes(), atomic.nodes(), "origin={origin:?}");
+            assert_parent_chain(&inc, &truth);
+            assert_valid_cut(&inc.cut.iter().map(|&(n, _)| (0, n)).collect::<Vec<_>>(), &truth);
+            distinct.insert(inc.nodes());
+        }
+        assert_eq!(distinct.len(), 4, "全葉 / 全 L1 / 兩種混合 = 4 種 cut");
+    }
+
+    /// 預算:64 葉 → max 30 要收 12 組;原子在同一姿態下展開 ps 最大的 4 個 L2,
+    /// 剩 12 個沒展 = 我們收掉的 12 個最小的。反向(從 4 個 L1 展到 30)也要相等。
+    /// ⚠️ 這個相等靠的是本樹每次展開都 +3(child_count 一律 4):原子的「第一個裝不下就停」
+    /// 與增量的「裝得下才展」在等步長之下才是同一件事;不等步長的差異留給 spec 討論。
+    #[test]
+    fn incremental_budget_rebalance_equals_atomic() {
+        let (splats, truth) = build_tree();
+        let limit = 0.03;
+        let near = pose(Vec3A::new(3.0, 0.0, -50.0)); // 側偏一點,讓 L2 之間 ps 有序可分
+        let far = pose(Vec3A::new(0.0, 0.0, -150.0));
+        let max = 30;
+
+        // 無預算的 64 葉 → 收到 30
+        let mut inc = expand_recording(&splats, &near, limit, 1000);
+        rebalance(&mut inc, &splats, &near, limit, max);
+        let atomic = expand_recording(&splats, &near, limit, max);
+        assert_eq!(inc.cut.len(), 28);
+        assert_eq!(inc.nodes(), atomic.nodes());
+        assert_parent_chain(&inc, &truth);
+
+        // 4 個 L1 → 展到 30
+        let mut inc = expand_recording(&splats, &far, limit, 1000);
+        assert_eq!(inc.cut.len(), 4);
+        rebalance(&mut inc, &splats, &near, limit, max);
+        assert_eq!(inc.nodes(), atomic.nodes());
+        assert_parent_chain(&inc, &truth);
     }
 
     #[test]
