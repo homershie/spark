@@ -9889,6 +9889,21 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.lodDirty = false;
     this.lodDirtyReasons = {};
     this.lodLastPoseDelta = { distance: 0, dot: 1 };
+    this.lodLastPoseDirty = {
+      distance: 0,
+      dot: 1,
+      hadPosOverride: false,
+      hadQuatOverride: false,
+      viewPos: [0, 0, 0],
+      lastPos: [0, 0, 0],
+      viewQuat: [0, 0, 0, 1],
+      lastQuat: [0, 0, 0, 1],
+      frame: 0,
+      camera: "",
+      renderSizeY: 0
+    };
+    this.lodPoseDirtyHist = { dotBelow: 0, distAbove: 0, both: 0 };
+    this.lodDriveCameras = {};
     this.lodLastLodMeshes = 0;
     this.lodDirtyOwned = false;
     this.lodIds = /* @__PURE__ */ new Map();
@@ -10424,6 +10439,10 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       this.bumpLodDirtyReason("external");
       this.lodDirtyOwned = true;
     }
+    {
+      const camKey = `${camera.type}:${camera.uuid.slice(0, 8)}`;
+      this.lodDriveCameras[camKey] = (this.lodDriveCameras[camKey] ?? 0) + 1;
+    }
     const defaultSplatCount = this.defaultSplatTarget();
     const splatCount = this.lodSplatCount ?? defaultSplatCount;
     const maxSplats = splatCount * this.lodSplatScale;
@@ -10463,6 +10482,23 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       this.lodLastPoseDelta.distance = distance2;
       this.lodLastPoseDelta.dot = dot2;
       if (similarity < 0.999) {
+        const distAbove = distance2 >= 1e-3;
+        const dotBelow = dot2 < 0.99999;
+        if (distAbove && dotBelow) this.lodPoseDirtyHist.both += 1;
+        else if (distAbove) this.lodPoseDirtyHist.distAbove += 1;
+        else if (dotBelow) this.lodPoseDirtyHist.dotBelow += 1;
+        const d = this.lodLastPoseDirty;
+        d.distance = distance2;
+        d.dot = dot2;
+        d.hadPosOverride = !!this.lodPosOverride;
+        d.hadQuatOverride = !!this.lodQuatOverride;
+        d.viewPos = viewPos.toArray();
+        d.lastPos = this.lastLod.pos.toArray();
+        d.viewQuat = viewQuat.toArray();
+        d.lastQuat = this.lastLod.quat.toArray();
+        d.frame = this.renderer.info.render.frame;
+        d.camera = camera.type;
+        d.renderSizeY = this.renderSize.y;
         this.markLodDirty("pose");
       }
     }

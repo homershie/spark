@@ -449,8 +449,29 @@ export class SparkRenderer extends THREE.Mesh {
    * external(進 driveLod 時已經是 true = 外部寫的)。
    */
   lodDirtyReasons: Record<string, number> = {};
-  /** 最近一次 pose 比對量到的位移與四元數 dot(看姿態到底動了多遠)。 */
+  /** 最近一次 pose 比對量到的位移與四元數 dot(每幀寫,看姿態到底動了多遠)。 */
   lodLastPoseDelta = { distance: 0, dot: 1 };
+  /**
+   * `markLodDirty("pose")` **當下**那一幀的完整快照(每幀寫的 lodLastPoseDelta 會被
+   * 後面乾淨的幀蓋掉,看不到觸發那一幀)。陣列都是 plain number,可直接 JSON。
+   */
+  lodLastPoseDirty = {
+    distance: 0,
+    dot: 1,
+    hadPosOverride: false,
+    hadQuatOverride: false,
+    viewPos: [0, 0, 0] as number[],
+    lastPos: [0, 0, 0] as number[],
+    viewQuat: [0, 0, 0, 1] as number[],
+    lastQuat: [0, 0, 0, 1] as number[],
+    frame: 0,
+    camera: "",
+    renderSizeY: 0,
+  };
+  /** pose 標髒是哪條 ramp 造成的(累計):距離 ≥ 0.001 / dot < 0.99999 / 兩者。 */
+  lodPoseDirtyHist = { dotBelow: 0, distAbove: 0, both: 0 };
+  /** 每次 driveLod 的 camera(`type:uuid前8碼`)累計次數 —— 看是不是不只一顆相機在驅動。 */
+  lodDriveCameras: Record<string, number> = {};
   /** 這一幀參與 LoD 的 mesh 數(= lodMeshes.length)。 */
   lodLastLodMeshes = 0;
   /** lodDirty 目前這個 true 是不是 driveLod 自己標的(false 且 lodDirty=true ⇒ 外部寫的)。 */
@@ -1195,6 +1216,10 @@ export class SparkRenderer extends THREE.Mesh {
       this.bumpLodDirtyReason("external");
       this.lodDirtyOwned = true;
     }
+    {
+      const camKey = `${camera.type}:${camera.uuid.slice(0, 8)}`;
+      this.lodDriveCameras[camKey] = (this.lodDriveCameras[camKey] ?? 0) + 1;
+    }
 
     const defaultSplatCount = this.defaultSplatTarget();
     const splatCount = this.lodSplatCount ?? defaultSplatCount;
@@ -1243,6 +1268,23 @@ export class SparkRenderer extends THREE.Mesh {
       this.lodLastPoseDelta.distance = distance;
       this.lodLastPoseDelta.dot = dot;
       if (similarity < 0.999) {
+        const distAbove = distance >= 0.001;
+        const dotBelow = dot < 0.99999;
+        if (distAbove && dotBelow) this.lodPoseDirtyHist.both += 1;
+        else if (distAbove) this.lodPoseDirtyHist.distAbove += 1;
+        else if (dotBelow) this.lodPoseDirtyHist.dotBelow += 1;
+        const d = this.lodLastPoseDirty;
+        d.distance = distance;
+        d.dot = dot;
+        d.hadPosOverride = !!this.lodPosOverride;
+        d.hadQuatOverride = !!this.lodQuatOverride;
+        d.viewPos = viewPos.toArray();
+        d.lastPos = this.lastLod.pos.toArray();
+        d.viewQuat = viewQuat.toArray();
+        d.lastQuat = this.lastLod.quat.toArray();
+        d.frame = this.renderer.info.render.frame;
+        d.camera = camera.type;
+        d.renderSizeY = this.renderSize.y;
         this.markLodDirty("pose");
       }
     }

@@ -405,11 +405,36 @@ export declare class SparkRenderer extends THREE.Mesh {
      * external(進 driveLod 時已經是 true = 外部寫的)。
      */
     lodDirtyReasons: Record<string, number>;
-    /** 最近一次 pose 比對量到的位移與四元數 dot(看姿態到底動了多遠)。 */
+    /** 最近一次 pose 比對量到的位移與四元數 dot(每幀寫,看姿態到底動了多遠)。 */
     lodLastPoseDelta: {
         distance: number;
         dot: number;
     };
+    /**
+     * `markLodDirty("pose")` **當下**那一幀的完整快照(每幀寫的 lodLastPoseDelta 會被
+     * 後面乾淨的幀蓋掉,看不到觸發那一幀)。陣列都是 plain number,可直接 JSON。
+     */
+    lodLastPoseDirty: {
+        distance: number;
+        dot: number;
+        hadPosOverride: boolean;
+        hadQuatOverride: boolean;
+        viewPos: number[];
+        lastPos: number[];
+        viewQuat: number[];
+        lastQuat: number[];
+        frame: number;
+        camera: string;
+        renderSizeY: number;
+    };
+    /** pose 標髒是哪條 ramp 造成的(累計):距離 ≥ 0.001 / dot < 0.99999 / 兩者。 */
+    lodPoseDirtyHist: {
+        dotBelow: number;
+        distAbove: number;
+        both: number;
+    };
+    /** 每次 driveLod 的 camera(`type:uuid前8碼`)累計次數 —— 看是不是不只一顆相機在驅動。 */
+    lodDriveCameras: Record<string, number>;
     /** 這一幀參與 LoD 的 mesh 數(= lodMeshes.length)。 */
     lodLastLodMeshes: number;
     /** lodDirty 目前這個 true 是不是 driveLod 自己標的(false 且 lodDirty=true ⇒ 外部寫的)。 */
