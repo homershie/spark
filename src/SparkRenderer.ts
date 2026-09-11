@@ -1701,10 +1701,12 @@ export class SparkRenderer extends THREE.Mesh {
       }));
 
       // 不變式(spec §4.5):pager 不能釋放**螢幕上那份 cut** 用到的頁。這片沒套用時螢幕上的
-      // 仍是上一份,所以 fetchPriority = 這片的 chunks(新輪的串流要繼續)+ 上一份套用的 chunks
-      // (顯示中的頁維持 needed)。套用了就只有這片的,與原本相同。
+      // 仍是上一份,所以 fetchPriority = 上一份套用的 chunks(螢幕上的 cut,排最前面)+ 這片的
+      // chunks(新輪的串流,排後面)。SplatPager.driveFetchers 只把前 maxPages 筆標成
+      // needed、其餘視為可釋放 —— 螢幕上的 cut 排前面才能保證 page 池不足時被擠掉的是新輪
+      // 尚未顯示的頁,不是螢幕上的。套用了就只有這片的,與原本相同。
       const seen = new Set<number>();
-      const lists = apply ? [chunks] : [chunks, this.lastAppliedChunks];
+      const lists = apply ? [chunks] : [this.lastAppliedChunks, chunks];
       for (const list of lists) {
         for (const [lodId, chunk] of list) {
           const key = lodId * 2 ** 20 + chunk;

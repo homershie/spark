@@ -10777,7 +10777,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         chunk: 0
       }));
       const seen = /* @__PURE__ */ new Set();
-      const lists = apply ? [chunks] : [chunks, this.lastAppliedChunks];
+      const lists = apply ? [chunks] : [this.lastAppliedChunks, chunks];
       for (const list of lists) {
         for (const [lodId, chunk] of list) {
           const key = lodId * 2 ** 20 + chunk;
