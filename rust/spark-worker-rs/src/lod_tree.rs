@@ -9,6 +9,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::lod_traverse::{
     expand_until, is_fresh, seed_roots, InstanceParams, LoopExit, RoundMeta, TraverseCore, TreeView,
+    MAX_INSTANCES, MAX_PAGED_INDEX,
 };
 
 const MAX_SPLAT_CHUNK: usize = 65536;
@@ -396,6 +397,10 @@ pub fn traverse_lod_trees(
     if cone_fovs.len() != num_instances {
         return Err(JsValue::from_str("Invalid cone_fovs length"));
     }
+    // frontier heap 的 u64 打包位寬(lod_traverse::Entry):超過就明確拒絕,不靜默錯位。
+    if num_instances > MAX_INSTANCES {
+        return Err(JsValue::from_str(&format!("Too many LoD instances: {num_instances} > {MAX_INSTANCES}")));
+    }
 
     // 這次呼叫自己的姿態 / foveation 參數(切片模式只在 round 開始時算一次、之後沿用 round 的)。
     let make_params = || -> Vec<InstanceParams> {
@@ -419,6 +424,15 @@ pub fn traverse_lod_trees(
 
     STATE.with_borrow_mut(|state| {
         let LodState { lod_trees, core, scratch, round, .. } = state;
+
+        for id in lod_ids {
+            let n = lod_trees.get(id).map_or(0, |t| t.splats.borrow().len());
+            if n > MAX_PAGED_INDEX {
+                return Err(JsValue::from_str(&format!(
+                    "LoD tree {id} has {n} paged slots > {MAX_PAGED_INDEX} (512 pages); reduce pager maxSplats"
+                )));
+            }
+        }
 
         if budget_ms <= 0.0 {
             // 原子模式:自己的參數、自己的 core、跑到底。`core` / `round` 原封不動,

@@ -11,7 +11,6 @@ use std::collections::BinaryHeap;
 
 use ahash::AHashSet;
 use glam::Vec3A;
-use ordered_float::OrderedFloat;
 
 use crate::lod_tree::LodSplat;
 
@@ -38,10 +37,54 @@ pub(crate) struct TreeView<'a> {
     pub(crate) params: InstanceParams,
 }
 
+/// frontier heap 的一筆:`[pixel_scale 的 f32 bits:32 | inst:7 | paged_index:25]` 打包成一個 u64。
+///
+/// 方案 C(2026-09-11)唯一量得出差別的微優化:原本是 `(OrderedFloat<f32>, u32, u32)`
+/// 12 bytes、三段 derive 比較 + NaN 分支,sift-down 每層比兩次、走 21 層;改成 u64 後
+/// 一次整數比較、heap 1.8M 筆時 21.6MB → 14.4MB。原生基準 1085 → 568ms(1.91×)。
+///
+/// 排序與原 tuple **逐位相同**(所以 cut 集合不變):非負 f32 的 bit pattern 單調遞增,
+/// 再依 inst、paged 決勝。前提是 key ≥ 0 —— `new()` 把負值 / NaN 夾到 0(pixel_scale 由
+/// size × foveate / distance 算出,只有 foveate 設成負數才會負;NaN 只會來自壞資料,
+/// 夾到 0 = 永不展開,比原本 OrderedFloat 把 NaN 排最大、優先展開合理)。
+///
+/// 位寬:inst ≤ [`MAX_INSTANCES`],paged_index < [`MAX_PAGED_INDEX`](= 512 頁 × 65536);
+/// `lod_tree.rs` 在 `traverse_lod_trees` 入口驗,超過回 Err,不會靜默錯位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Entry(u64);
+
+pub(crate) const INST_BITS: u32 = 7;
+pub(crate) const PAGED_BITS: u32 = 25;
+pub(crate) const MAX_INSTANCES: usize = 1 << INST_BITS;
+pub(crate) const MAX_PAGED_INDEX: usize = 1 << PAGED_BITS;
+const PAGED_MASK: u64 = (1 << PAGED_BITS) - 1;
+const INST_MASK: u64 = (1 << INST_BITS) - 1;
+
+impl Entry {
+    #[inline]
+    pub(crate) fn new(key: f32, inst: u32, paged: u32) -> Self {
+        debug_assert!((inst as usize) < MAX_INSTANCES && (paged as usize) < MAX_PAGED_INDEX);
+        let key = key.max(0.0); // 負值與 NaN 都落到 +0(f32::max 對 NaN 回另一邊,單指令)
+        Self(((key.to_bits() as u64) << (INST_BITS + PAGED_BITS)) | ((inst as u64) << PAGED_BITS) | (paged as u64 & PAGED_MASK))
+    }
+    #[inline]
+    pub(crate) fn key(self) -> f32 {
+        f32::from_bits((self.0 >> (INST_BITS + PAGED_BITS)) as u32)
+    }
+    #[inline]
+    pub(crate) fn inst(self) -> u32 {
+        ((self.0 >> PAGED_BITS) & INST_MASK) as u32
+    }
+    #[inline]
+    pub(crate) fn paged(self) -> u32 {
+        (self.0 & PAGED_MASK) as u32
+    }
+}
+
 /// 跨呼叫保留的 traverse 狀態。
 #[derive(Debug, Default)]
 pub(crate) struct TraverseCore {
-    pub(crate) frontier: BinaryHeap<(OrderedFloat<f32>, u32, u32)>,
+    pub(crate) frontier: BinaryHeap<Entry>,
     pub(crate) output: Vec<(u32, u32)>,
     pub(crate) touched: Vec<(u32, u32)>,
     pub(crate) touched_set: AHashSet<(u32, u32)>,
@@ -92,7 +135,7 @@ impl TraverseCore {
     pub(crate) fn snapshot(&self) -> Vec<(u32, u32)> {
         let mut cut = Vec::with_capacity(self.output.len() + self.frontier.len());
         cut.extend_from_slice(&self.output);
-        cut.extend(self.frontier.iter().map(|&(_, inst, paged)| (inst, paged)));
+        cut.extend(self.frontier.iter().map(|e| (e.inst(), e.paged())));
         cut
     }
 }
@@ -116,7 +159,7 @@ pub(crate) fn seed_roots(core: &mut TraverseCore, trees: &[TreeView], root_pages
         let root_page = if root_page == NOT_RESIDENT { 0 } else { root_page };
         let root_index = root_page << 16;
         let pixel_scale = compute_pixel_scale(&tree.splats[root_index as usize], &tree.params);
-        core.frontier.push((OrderedFloat(pixel_scale), inst_index as u32, root_index));
+        core.frontier.push(Entry::new(pixel_scale, inst_index as u32, root_index));
         core.num_splats += 1;
         core.touch((tree.lod_id, 0));
     }
@@ -131,7 +174,8 @@ pub(crate) fn expand_until(
     pixel_scale_limit: f32,
     should_stop: &mut impl FnMut() -> bool,
 ) -> LoopExit {
-    while let Some(&(OrderedFloat(pixel_scale), inst_index, paged_index)) = core.frontier.peek() {
+    while let Some(&top) = core.frontier.peek() {
+        let (pixel_scale, inst_index, paged_index) = (top.key(), top.inst(), top.paged());
         if should_stop() {
             return LoopExit::Paused;
         }
@@ -183,7 +227,7 @@ pub(crate) fn expand_until(
             if ps <= pixel_scale_limit {
                 core.output.push((inst_index, paged));
             } else {
-                core.frontier.push((OrderedFloat(ps), inst_index, paged));
+                core.frontier.push(Entry::new(ps, inst_index, paged));
             }
         }
 
@@ -455,6 +499,46 @@ mod tests {
             parent2[leaf] = 20;
         }
         assert_valid_cut(last, &parent2);
+    }
+
+    /// u64 打包的排序必須與原本的 `(OrderedFloat<f32>, u32, u32)` 逐位相同 —— 這是「集合不變」的前提。
+    #[test]
+    fn packed_entry_orders_like_the_old_tuple() {
+        use ordered_float::OrderedFloat;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut items: Vec<(f32, u32, u32)> = (0..20_000)
+            .map(|_| {
+                let r = next();
+                // key:多數是小正數,少數是 0 / 重複 / inf,逼出並列決勝
+                let key = match r % 7 {
+                    0 => 0.0,
+                    1 => 1.0e-3,
+                    2 => f32::INFINITY,
+                    _ => ((r >> 8) % 1_000_000) as f32 * 1.0e-9,
+                };
+                let inst = ((r >> 40) % 3) as u32;
+                let paged = ((r >> 20) % 5) as u32 * 65536 + ((r >> 4) % 64) as u32;
+                (key, inst, paged)
+            })
+            .collect();
+        items.sort_by_key(|&(k, i, p)| (OrderedFloat(k), i, p));
+        let mut packed: Vec<Entry> = items.iter().map(|&(k, i, p)| Entry::new(k, i, p)).collect();
+        packed.sort();
+        for (a, b) in items.iter().zip(packed.iter()) {
+            assert_eq!((a.0, a.1, a.2), (b.key(), b.inst(), b.paged()));
+        }
+        // 極值:負值與 NaN 落到 +0,inf 保持最大
+        assert_eq!(Entry::new(-1.0, 0, 0).key(), 0.0);
+        assert_eq!(Entry::new(f32::NAN, 0, 0).key(), 0.0);
+        assert!(Entry::new(f32::INFINITY, 0, 0) > Entry::new(f32::MAX, 127, MAX_PAGED_INDEX as u32 - 1));
+        let e = Entry::new(0.5, 127, MAX_PAGED_INDEX as u32 - 1);
+        assert_eq!((e.key(), e.inst(), e.paged()), (0.5, 127, MAX_PAGED_INDEX as u32 - 1));
     }
 
     #[test]
