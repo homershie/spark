@@ -19,6 +19,8 @@ mod ext_splats;
 
 mod lod_tree;
 mod lod_traverse;
+#[cfg(test)]
+mod lod_synth;
 
 #[wasm_bindgen(start)]
 pub fn wasm_start() {

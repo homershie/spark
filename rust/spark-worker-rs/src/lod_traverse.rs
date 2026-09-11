@@ -192,6 +192,12 @@ pub(crate) fn expand_until(
     LoopExit::Done
 }
 
+/// 把「像素尺度門檻」換成 heap key 的空間。今天 key 就是 pixel_scale,所以是恆等;
+/// 這層存在是讓 key 的表示(例如改成平方)只改一處。
+pub(crate) fn limit_key(pixel_scale_limit: f32) -> f32 {
+    pixel_scale_limit
+}
+
 /// 與 v2.1.0 的 `compute_pixel_scale` 同式,只是參數改吃 `InstanceParams`。
 pub(crate) fn compute_pixel_scale(splat: &LodSplat, p: &InstanceParams) -> f32 {
     let center = splat.center();
