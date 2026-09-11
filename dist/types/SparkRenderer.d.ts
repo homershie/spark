@@ -399,6 +399,21 @@ export declare class SparkRenderer extends THREE.Mesh {
         version: number;
     }[];
     lodDirty: boolean;
+    /**
+     * 診斷讀數:每個「把 lodDirty 標髒」的來源各累計幾次(自頁面載入起,不歸零)。
+     * key:pixelScaleLimit / maxSplats / pose / meshCount / meshVersion / init /
+     * external(進 driveLod 時已經是 true = 外部寫的)。
+     */
+    lodDirtyReasons: Record<string, number>;
+    /** 最近一次 pose 比對量到的位移與四元數 dot(看姿態到底動了多遠)。 */
+    lodLastPoseDelta: {
+        distance: number;
+        dot: number;
+    };
+    /** 這一幀參與 LoD 的 mesh 數(= lodMeshes.length)。 */
+    lodLastLodMeshes: number;
+    /** lodDirty 目前這個 true 是不是 driveLod 自己標的(false 且 lodDirty=true ⇒ 外部寫的)。 */
+    private lodDirtyOwned;
     lodIds: Map<PackedSplats | ExtSplats | PagedSplats, {
         lodId: number;
         lastTouched: number;
@@ -555,6 +570,9 @@ export declare class SparkRenderer extends THREE.Mesh {
     private ensureLodWorker;
     defaultSplatTarget(): 500000 | 750000 | 1000000 | 1500000 | 2500000;
     private driveLod;
+    private bumpLodDirtyReason;
+    /** driveLod 內部標髒的唯一入口:記次數 + 記「這次是我們自己標的」(區分 external)。 */
+    private markLodDirty;
     private initLodTree;
     private pageSizeWarning;
     private updateLodInstances;

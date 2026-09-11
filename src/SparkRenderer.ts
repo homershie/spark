@@ -443,6 +443,18 @@ export class SparkRenderer extends THREE.Mesh {
   lodWorker: SplatWorker | null = null;
   lodMeshes: { mesh: SplatMesh; version: number }[] = [];
   lodDirty = false;
+  /**
+   * 診斷讀數:每個「把 lodDirty 標髒」的來源各累計幾次(自頁面載入起,不歸零)。
+   * key:pixelScaleLimit / maxSplats / pose / meshCount / meshVersion / init /
+   * external(進 driveLod 時已經是 true = 外部寫的)。
+   */
+  lodDirtyReasons: Record<string, number> = {};
+  /** 最近一次 pose 比對量到的位移與四元數 dot(看姿態到底動了多遠)。 */
+  lodLastPoseDelta = { distance: 0, dot: 1 };
+  /** 這一幀參與 LoD 的 mesh 數(= lodMeshes.length)。 */
+  lodLastLodMeshes = 0;
+  /** lodDirty 目前這個 true 是不是 driveLod 自己標的(false 且 lodDirty=true ⇒ 外部寫的)。 */
+  private lodDirtyOwned = false;
   lodIds: Map<
     PackedSplats | ExtSplats | PagedSplats,
     { lodId: number; lastTouched: number; rootPage?: number }
@@ -1178,6 +1190,12 @@ export class SparkRenderer extends THREE.Mesh {
     camera: THREE.Camera;
     scene: THREE.Scene;
   }) {
+    if (this.lodDirty && !this.lodDirtyOwned) {
+      // 進來時已經是 true、又不是 driveLod 自己標的 → 外部寫的(專案端 renderer.lodDirty = true)
+      this.bumpLodDirtyReason("external");
+      this.lodDirtyOwned = true;
+    }
+
     const defaultSplatCount = this.defaultSplatTarget();
     const splatCount = this.lodSplatCount ?? defaultSplatCount;
     const maxSplats = splatCount * this.lodSplatScale;
@@ -1210,11 +1228,11 @@ export class SparkRenderer extends THREE.Mesh {
     }
 
     if (this.lastLod) {
-      if (
-        this.lastLod.pixelScaleLimit !== pixelScaleLimit ||
-        this.lastLod.maxSplats !== maxSplats
-      ) {
-        this.lodDirty = true;
+      if (this.lastLod.pixelScaleLimit !== pixelScaleLimit) {
+        this.markLodDirty("pixelScaleLimit");
+      }
+      if (this.lastLod.maxSplats !== maxSplats) {
+        this.markLodDirty("maxSplats");
       }
 
       const distance = viewPos.distanceTo(this.lastLod.pos);
@@ -1222,8 +1240,10 @@ export class SparkRenderer extends THREE.Mesh {
       const dot = viewQuat.dot(this.lastLod.quat);
       const quatRamp = Math.max(0.0, 1.0 - (1.0 - dot) / 0.01);
       const similarity = distanceRamp * quatRamp;
+      this.lodLastPoseDelta.distance = distance;
+      this.lodLastPoseDelta.dot = dot;
       if (similarity < 0.999) {
-        this.lodDirty = true;
+        this.markLodDirty("pose");
       }
     }
 
@@ -1239,9 +1259,10 @@ export class SparkRenderer extends THREE.Mesh {
           );
         }) as SplatMesh[]);
     const hasPaged = lodMeshes.some((mesh) => mesh.paged);
+    this.lodLastLodMeshes = lodMeshes.length;
 
     if (this.lodMeshes.length !== lodMeshes.length) {
-      this.lodDirty = true;
+      this.markLodDirty("meshCount");
     } else {
       if (
         lodMeshes.some(
@@ -1250,7 +1271,7 @@ export class SparkRenderer extends THREE.Mesh {
             m.version > this.lodMeshes[i].version,
         )
       ) {
-        this.lodDirty = true;
+        this.markLodDirty("meshVersion");
       }
     }
 
@@ -1311,7 +1332,7 @@ export class SparkRenderer extends THREE.Mesh {
           const splats = lodInitQueue.shift();
           if (splats) {
             await this.initLodTree(worker, splats);
-            this.lodDirty = true;
+            this.markLodDirty("init");
           }
         }
       }
@@ -1367,6 +1388,7 @@ export class SparkRenderer extends THREE.Mesh {
           timestamp: roundNow,
         };
         this.lodDirty = false;
+        this.lodDirtyOwned = false;
         // 新 round 從 root 重開,updateLodTrees 這幀已經跑過,它看得到那批頁 —— 不必再補 tree 輪
         this.lodTreeDirty = false;
         if (this.lodRound && !this.lodRound.done) {
@@ -1420,6 +1442,17 @@ export class SparkRenderer extends THREE.Mesh {
 
       await this.cleanupLodTrees(worker);
     });
+  }
+
+  private bumpLodDirtyReason(reason: string) {
+    this.lodDirtyReasons[reason] = (this.lodDirtyReasons[reason] ?? 0) + 1;
+  }
+
+  /** driveLod 內部標髒的唯一入口:記次數 + 記「這次是我們自己標的」(區分 external)。 */
+  private markLodDirty(reason: string) {
+    this.bumpLodDirtyReason(reason);
+    this.lodDirty = true;
+    this.lodDirtyOwned = true;
   }
 
   private async initLodTree(

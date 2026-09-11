@@ -9887,6 +9887,10 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.lodWorker = null;
     this.lodMeshes = [];
     this.lodDirty = false;
+    this.lodDirtyReasons = {};
+    this.lodLastPoseDelta = { distance: 0, dot: 1 };
+    this.lodLastLodMeshes = 0;
+    this.lodDirtyOwned = false;
     this.lodIds = /* @__PURE__ */ new Map();
     this.lodIdToSplats = /* @__PURE__ */ new Map();
     this.lodInitQueue = [];
@@ -10416,6 +10420,10 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     scene
   }) {
     var _a2, _b2;
+    if (this.lodDirty && !this.lodDirtyOwned) {
+      this.bumpLodDirtyReason("external");
+      this.lodDirtyOwned = true;
+    }
     const defaultSplatCount = this.defaultSplatTarget();
     const splatCount = this.lodSplatCount ?? defaultSplatCount;
     const maxSplats = splatCount * this.lodSplatScale;
@@ -10441,16 +10449,21 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       viewQuat.copy(this.lodQuatOverride).normalize();
     }
     if (this.lastLod) {
-      if (this.lastLod.pixelScaleLimit !== pixelScaleLimit || this.lastLod.maxSplats !== maxSplats) {
-        this.lodDirty = true;
+      if (this.lastLod.pixelScaleLimit !== pixelScaleLimit) {
+        this.markLodDirty("pixelScaleLimit");
+      }
+      if (this.lastLod.maxSplats !== maxSplats) {
+        this.markLodDirty("maxSplats");
       }
       const distance2 = viewPos.distanceTo(this.lastLod.pos);
       const distanceRamp = Math.max(0, 1 - distance2 / 1);
       const dot2 = viewQuat.dot(this.lastLod.quat);
       const quatRamp = Math.max(0, 1 - (1 - dot2) / 0.01);
       const similarity = distanceRamp * quatRamp;
+      this.lodLastPoseDelta.distance = distance2;
+      this.lodLastPoseDelta.dot = dot2;
       if (similarity < 0.999) {
-        this.lodDirty = true;
+        this.markLodDirty("pose");
       }
     }
     const lodMeshes = !this.enableLod ? [] : visibleGenerators.filter((generator) => {
@@ -10458,13 +10471,14 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       return generator instanceof SplatMesh && (((_a3 = generator.packedSplats) == null ? void 0 : _a3.lodSplats) || ((_b3 = generator.extSplats) == null ? void 0 : _b3.lodSplats) || generator.paged) && generator.enableLod !== false;
     });
     const hasPaged = lodMeshes.some((mesh) => mesh.paged);
+    this.lodLastLodMeshes = lodMeshes.length;
     if (this.lodMeshes.length !== lodMeshes.length) {
-      this.lodDirty = true;
+      this.markLodDirty("meshCount");
     } else {
       if (lodMeshes.some(
         (m, i) => m !== this.lodMeshes[i].mesh || m.version > this.lodMeshes[i].version
       )) {
-        this.lodDirty = true;
+        this.markLodDirty("meshVersion");
       }
     }
     this.lodMeshes = lodMeshes.map((mesh) => ({
@@ -10512,7 +10526,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
           const splats = lodInitQueue.shift();
           if (splats) {
             await this.initLodTree(worker, splats);
-            this.lodDirty = true;
+            this.markLodDirty("init");
           }
         }
       }
@@ -10555,6 +10569,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
           timestamp: roundNow
         };
         this.lodDirty = false;
+        this.lodDirtyOwned = false;
         this.lodTreeDirty = false;
         if (this.lodRound && !this.lodRound.done) {
           this.finishLodRound(this.lodRound, true);
@@ -10605,6 +10620,15 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       }
       await this.cleanupLodTrees(worker);
     });
+  }
+  bumpLodDirtyReason(reason) {
+    this.lodDirtyReasons[reason] = (this.lodDirtyReasons[reason] ?? 0) + 1;
+  }
+  /** driveLod 內部標髒的唯一入口:記次數 + 記「這次是我們自己標的」(區分 external)。 */
+  markLodDirty(reason) {
+    this.bumpLodDirtyReason(reason);
+    this.lodDirty = true;
+    this.lodDirtyOwned = true;
   }
   async initLodTree(worker, splats) {
     if (splats instanceof PackedSplats || splats instanceof ExtSplats) {
