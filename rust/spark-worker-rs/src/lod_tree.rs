@@ -262,23 +262,10 @@ pub fn get_lod_tree_level(lod_id: u32, level: u32) -> anyhow::Result<Object, JsV
     })
 }
 
-#[wasm_bindgen]
-pub fn traverse_lod_trees(
-    max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
-    lod_ids: &[u32], root_pages: &[u32],
-    view_to_objects: &[f32], lod_scales: &[f32],
-    behind_foveates: &[f32], cone_foveates: &[f32],
-    cone_fov0s: &[f32], cone_fovs: &[f32],
-) -> anyhow::Result<Object, JsValue> {
-    traverse_lod_trees_sliced(
-        max_splats, pixel_scale_limit, _last_pixel_limit, lod_ids, root_pages, view_to_objects,
-        lod_scales, behind_foveates, cone_foveates, cone_fov0s, cone_fovs, 0.0, true,
-    )
-}
-
 /// 可續跑的 traverse。`budget_ms <= 0` = 原子(跑到底、清狀態,與 v2.1.0 逐位相同);
 /// `restart` = 丟掉現有 round 從 root 重開。設計見本專案 spec §4。
-fn traverse_lod_trees_sliced(
+#[wasm_bindgen]
+pub fn traverse_lod_trees(
     max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
     lod_ids: &[u32], root_pages: &[u32],
     view_to_objects: &[f32], lod_scales: &[f32],
