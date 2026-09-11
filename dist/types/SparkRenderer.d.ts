@@ -1,6 +1,7 @@
 import { ExtSplats, PackedSplats, PagedSplats, SplatMesh, SplatPager } from '.';
 import { SplatAccumulator } from './SplatAccumulator';
 import { SplatWorker } from './SplatWorker';
+import { LodRound, LodRoundStats } from './lodRound';
 import * as THREE from "three";
 export interface SparkRendererOptions {
     /**
@@ -176,6 +177,22 @@ export interface SparkRendererOptions {
      */
     lodRenderScale?: number;
     /**
+     * LoD traverse 時間切片:每片預算(ms)。每片結束把目前的 cut 套到 GPU,下一幀續跑,
+     * 轉頭/走動後 ~一片的時間就有新視角的粗 cut。0 = 關(跑到底才套,v2.1.0 行為)。
+     * @default 40
+     */
+    lodSliceMs?: number;
+    /**
+     * 第一片預算(ms);0 = 同 lodSliceMs。拉長它可壓「轉頭時重疊區先變粗再變細」。
+     * @default 0
+     */
+    lodFirstSliceMs?: number;
+    /**
+     * round 開始後 N ms 內不被姿態變動中止(0 = 一髒就重開)。
+     * @default 0
+     */
+    lodHoldMs?: number;
+    /**
      * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
      * @default false
      */
@@ -348,6 +365,19 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodSplatCount?: number;
     lodSplatScale: number;
     lodRenderScale: number;
+    lodSliceMs: number;
+    lodFirstSliceMs: number;
+    lodHoldMs: number;
+    /** 目前在跑的 round;null = 沒有。 */
+    lodRound: LodRound | null;
+    /** 頁面更新到了、但要等這輪跑完再補一輪(見 lodRound.ts / driveLod)。 */
+    lodTreeDirty: boolean;
+    /** 每結束一輪(完成或中止)+1;讀數的邊緣訊號。 */
+    lodRoundSeq: number;
+    /** 最近結束的一輪。 */
+    lastLodRound?: LodRoundStats;
+    /** round 開始時算的位移預測(沿用 v2.1.0 的 deltaPred,updateLodInstances 目前沒用它)。 */
+    private lodDeltaPred;
     lodInflate: boolean;
     pagedExtSplats: boolean;
     maxPagedSplats: number;
@@ -524,6 +554,8 @@ export declare class SparkRenderer extends THREE.Mesh {
     private initLodTree;
     private pageSizeWarning;
     private updateLodInstances;
+    /** 一輪結束(完成或被姿態變動中止):記讀數、推進 lodRoundSeq。 */
+    private finishLodRound;
     private cleanupLodTrees;
     private updateLodIndices;
     private readbackDepth;

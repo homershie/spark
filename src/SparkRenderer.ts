@@ -12,6 +12,13 @@ import { SplatAccumulator } from "./SplatAccumulator";
 import { SplatGeometry } from "./SplatGeometry";
 import { SplatWorker } from "./SplatWorker";
 import { SPLAT_TEX_HEIGHT, SPLAT_TEX_WIDTH } from "./defines";
+import {
+  type LodRound,
+  type LodRoundStats,
+  canAbortRound,
+  newLodRound,
+  sliceBudget,
+} from "./lodRound";
 import { getShaders } from "./shaders";
 import {
   cloneClock,
@@ -205,6 +212,22 @@ export interface SparkRendererOptions {
    */
   lodRenderScale?: number;
   /**
+   * LoD traverse 時間切片:每片預算(ms)。每片結束把目前的 cut 套到 GPU,下一幀續跑,
+   * 轉頭/走動後 ~一片的時間就有新視角的粗 cut。0 = 關(跑到底才套,v2.1.0 行為)。
+   * @default 40
+   */
+  lodSliceMs?: number;
+  /**
+   * 第一片預算(ms);0 = 同 lodSliceMs。拉長它可壓「轉頭時重疊區先變粗再變細」。
+   * @default 0
+   */
+  lodFirstSliceMs?: number;
+  /**
+   * round 開始後 N ms 內不被姿態變動中止(0 = 一髒就重開)。
+   * @default 0
+   */
+  lodHoldMs?: number;
+  /**
    * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
    * @default false
    */
@@ -387,6 +410,19 @@ export class SparkRenderer extends THREE.Mesh {
   lodSplatCount?: number;
   lodSplatScale: number;
   lodRenderScale: number;
+  lodSliceMs: number;
+  lodFirstSliceMs: number;
+  lodHoldMs: number;
+  /** 目前在跑的 round;null = 沒有。 */
+  lodRound: LodRound | null = null;
+  /** 頁面更新到了、但要等這輪跑完再補一輪(見 lodRound.ts / driveLod)。 */
+  lodTreeDirty = false;
+  /** 每結束一輪(完成或中止)+1;讀數的邊緣訊號。 */
+  lodRoundSeq = 0;
+  /** 最近結束的一輪。 */
+  lastLodRound?: LodRoundStats;
+  /** round 開始時算的位移預測(沿用 v2.1.0 的 deltaPred,updateLodInstances 目前沒用它)。 */
+  private lodDeltaPred = new THREE.Vector3();
   lodInflate: boolean;
   pagedExtSplats: boolean;
   maxPagedSplats: number;
@@ -535,6 +571,9 @@ export class SparkRenderer extends THREE.Mesh {
     this.lodSplatCount = options.lodSplatCount;
     this.lodSplatScale = options.lodSplatScale ?? 1.0;
     this.lodRenderScale = options.lodRenderScale ?? 1.0;
+    this.lodSliceMs = options.lodSliceMs ?? 40;
+    this.lodFirstSliceMs = options.lodFirstSliceMs ?? 0;
+    this.lodHoldMs = options.lodHoldMs ?? 0;
     this.lodInflate = options.lodInflate ?? false;
     this.pagedExtSplats = options.pagedExtSplats ?? false;
     const defaultPages = isMobile() ? (isIos() ? 96 : 128) : 256;
@@ -1297,14 +1336,20 @@ export class SparkRenderer extends THREE.Mesh {
         const lodUpdates = this.lodUpdates;
         this.lodUpdates = [];
         await worker.call("updateLodTrees", { ranges: lodUpdates });
-        this.lodDirty = true;
+        // 切片之下頁面更新不再直接重算(每批頁都 restart 會讓 round 永遠跑不完):
+        // 記下來,這輪跑完再補一輪。新到的頁對這輪後續的展開已經立即可用。
+        this.lodTreeDirty = true;
       }
 
-      if (this.lodDirty) {
-        const now = performance.now();
+      // ── round 生命週期(spec §5.3)──
+      const roundNow = performance.now();
+      if (
+        this.lodDirty &&
+        canAbortRound(this.lodRound, roundNow, this.lodHoldMs)
+      ) {
         const deltaPred = new THREE.Vector3();
         if (this.lastLod) {
-          const deltaTime = Math.max(1, now - this.lastLod.timestamp);
+          const deltaTime = Math.max(1, roundNow - this.lastLod.timestamp);
           deltaPred
             .copy(viewPos)
             .sub(this.lastLod.pos)
@@ -1315,19 +1360,54 @@ export class SparkRenderer extends THREE.Mesh {
           quat: viewQuat,
           pixelScaleLimit,
           maxSplats,
-          timestamp: now,
+          timestamp: roundNow,
         };
         this.lodDirty = false;
+        if (this.lodRound && !this.lodRound.done) {
+          this.finishLodRound(this.lodRound, true);
+        }
+        this.lodRound = newLodRound(
+          roundNow,
+          this.lodRound ? "pose" : "init",
+          this.pager?.fetchers.length ?? 0,
+        );
+        this.lodDeltaPred = deltaPred;
+      } else if ((!this.lodRound || this.lodRound.done) && this.lodTreeDirty) {
+        this.lodTreeDirty = false;
+        this.lodRound = newLodRound(
+          roundNow,
+          "tree",
+          this.pager?.fetchers.length ?? 0,
+        );
+      }
 
-        await this.updateLodInstances(
+      if (this.lodRound && !this.lodRound.done) {
+        const round = this.lodRound;
+        const budgetMs = sliceBudget(
+          round.slice,
+          this.lodSliceMs,
+          this.lodFirstSliceMs,
+        );
+        const { done } = await this.updateLodInstances(
           worker,
-          deltaPred,
+          this.lodDeltaPred,
           lodMeshes,
           maxSplats,
           viewPos,
           viewQuat,
           pixelScaleLimit,
+          { budgetMs, restart: round.restart },
         );
+        round.restart = false;
+        round.slice += 1;
+        round.applied += 1;
+        if (round.applied === 1) {
+          round.firstApplyMs = performance.now() - round.startedAt;
+        }
+        round.done = done;
+        if (done) {
+          this.finishLodRound(round, false);
+        }
         this.currentLod = this.lastLod;
         this.setDirty();
       }
@@ -1368,7 +1448,8 @@ export class SparkRenderer extends THREE.Mesh {
     viewPos: THREE.Vector3,
     viewQuat: THREE.Quaternion,
     pixelScaleLimit: number,
-  ) {
+    slice: { budgetMs: number; restart: boolean },
+  ): Promise<{ done: boolean }> {
     // Commented out because it makes LoDing less stable
     // viewPos.add(deltaPred);
 
@@ -1438,6 +1519,8 @@ export class SparkRenderer extends THREE.Mesh {
       pixelScaleLimit,
       lastPixelLimit: this.lastPixelLimit,
       instances,
+      budgetMs: slice.budgetMs,
+      restart: slice.restart,
     })) as {
       keyIndices: Record<
         string,
@@ -1445,10 +1528,13 @@ export class SparkRenderer extends THREE.Mesh {
       >;
       chunks: [number, number][];
       pixelLimit?: number;
+      done: boolean;
+      slice: number;
+      sliceMs: number;
     };
     this.lastTraverseTime = performance.now() - traverseStart;
 
-    const { keyIndices, chunks, pixelLimit } = result;
+    const { keyIndices, chunks, pixelLimit, done } = result;
     this.lastPixelLimit = pixelLimit;
     const totalLodSplats = Object.values(keyIndices).reduce(
       (sum, { numSplats }) => sum + numSplats,
@@ -1516,6 +1602,9 @@ export class SparkRenderer extends THREE.Mesh {
         maxSplats: Math.min(this.lodRaycast, Math.round(totalLodSplats * 0.1)),
         pixelScaleLimit,
         instances,
+        // 原子模式:它跟主 traverse 共用 Rust 端的 buffer,跑完會把 round 清掉(spec D9)
+        budgetMs: 0,
+        restart: true,
       })) as {
         keyIndices: Record<
           string,
@@ -1523,6 +1612,10 @@ export class SparkRenderer extends THREE.Mesh {
         >;
       };
       const raycastTraverseTime = performance.now() - traverseStart;
+      // Rust 端的 round 已被原子呼叫清掉 —— 下一片必須從 root 重開
+      if (this.lodRound && !this.lodRound.done) {
+        this.lodRound.restart = true;
+      }
 
       const { keyIndices } = result;
       const totalRaycastSplats = Object.values(keyIndices).reduce(
@@ -1536,6 +1629,20 @@ export class SparkRenderer extends THREE.Mesh {
       }
       // console.log(`raycast traverse in ${raycastTraverseTime} ms, totalRaycastSplats=${totalRaycastSplats}`);
     }
+    return { done };
+  }
+
+  /** 一輪結束(完成或被姿態變動中止):記讀數、推進 lodRoundSeq。 */
+  private finishLodRound(round: LodRound, aborted: boolean) {
+    this.lastLodRound = {
+      firstApplyMs: round.firstApplyMs,
+      totalMs: performance.now() - round.startedAt,
+      slices: round.slice,
+      aborted,
+      cause: round.cause,
+      fetchersAtStart: round.fetchersAtStart,
+    };
+    this.lodRoundSeq += 1;
   }
 
   private async cleanupLodTrees(worker: SplatWorker) {
