@@ -210,17 +210,25 @@ mod tests {
             "synth: {} nodes, {} chunks, built in {:?}",
             tree.nodes.len(), tree.num_chunks, t.elapsed()
         );
-        for round in 0..3 {
+        let rounds = 5;
+        let mut best = [f64::INFINITY; 3];
+        for round in 0..rounds {
             for (k, &(origin, forward)) in POSES.iter().enumerate() {
                 let p = params(origin, forward);
                 let t = Instant::now();
                 let (cut, n) = run_atomic(&splats, &c2p, root_page, p, 2_500_000);
                 let ms = t.elapsed().as_secs_f64() * 1e3;
+                best[k] = best[k].min(ms);
                 eprintln!(
                     "round {round} pose {k}: {ms:7.1} ms  cut {n}  hash {:#018x}",
                     cut_hash(&cut)
                 );
             }
         }
+        // 取最小值:量的是演算法成本,不是這台機器當下的雜訊
+        eprintln!(
+            "MIN of {rounds}: pose0 {:.1} ms  pose1 {:.1} ms  pose2 {:.1} ms  sum {:.1} ms",
+            best[0], best[1], best[2], best.iter().sum::<f64>()
+        );
     }
 }
