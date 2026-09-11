@@ -368,9 +368,9 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodSliceMs: number;
     lodFirstSliceMs: number;
     lodHoldMs: number;
-    /** 目前在跑的 round;null = 沒有。 */
+    /** 目前在跑的 round;null = 沒有。cause=pose/init 切片跑;cause=tree 原子一次跑完(相機沒動不閃粗版)。 */
     lodRound: LodRound | null;
-    /** 頁面更新到了、但要等這輪跑完再補一輪(見 lodRound.ts / driveLod)。 */
+    /** 頁面更新到了、但要等這輪跑完再補一輪(見 lodRound.ts / driveLod);補的那輪走原子,不切片。 */
     lodTreeDirty: boolean;
     /** 每結束一輪(完成或中止)+1;讀數的邊緣訊號。 */
     lodRoundSeq: number;

@@ -10607,11 +10607,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE.Mesh {
       }
       if (this.lodRound && !this.lodRound.done) {
         const round2 = this.lodRound;
-        const budgetMs = sliceBudget(
-          round2.slice,
-          this.lodSliceMs,
-          this.lodFirstSliceMs
-        );
+        const budgetMs = round2.cause === "tree" ? 0 : sliceBudget(round2.slice, this.lodSliceMs, this.lodFirstSliceMs);
         const { done } = await this.updateLodInstances(
           worker,
           this.lodDeltaPred,

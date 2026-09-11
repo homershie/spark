@@ -413,9 +413,9 @@ export class SparkRenderer extends THREE.Mesh {
   lodSliceMs: number;
   lodFirstSliceMs: number;
   lodHoldMs: number;
-  /** 目前在跑的 round;null = 沒有。 */
+  /** 目前在跑的 round;null = 沒有。cause=pose/init 切片跑;cause=tree 原子一次跑完(相機沒動不閃粗版)。 */
   lodRound: LodRound | null = null;
-  /** 頁面更新到了、但要等這輪跑完再補一輪(見 lodRound.ts / driveLod)。 */
+  /** 頁面更新到了、但要等這輪跑完再補一輪(見 lodRound.ts / driveLod);補的那輪走原子,不切片。 */
   lodTreeDirty = false;
   /** 每結束一輪(完成或中止)+1;讀數的邊緣訊號。 */
   lodRoundSeq = 0;
@@ -1460,11 +1460,13 @@ export class SparkRenderer extends THREE.Mesh {
 
       if (this.lodRound && !this.lodRound.done) {
         const round = this.lodRound;
-        const budgetMs = sliceBudget(
-          round.slice,
-          this.lodSliceMs,
-          this.lodFirstSliceMs,
-        );
+        // cause=tree(頁面到了、相機沒動)走原子:相機沒動就沒有「先看到粗版」的理由,
+        // 切片會讓畫面先退成粗 cut 再細回來(看起來像從頭重來 ~3 次);原子一次換掉整份 cut,
+        // = v2.1.0 的行為,不會閃。只有 pose / init 輪才切片。
+        const budgetMs =
+          round.cause === "tree"
+            ? 0
+            : sliceBudget(round.slice, this.lodSliceMs, this.lodFirstSliceMs);
         const { done } = await this.updateLodInstances(
           worker,
           this.lodDeltaPred,
