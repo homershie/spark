@@ -732,6 +732,8 @@ function traverseLodTrees({
   pixelScaleLimit,
   lastPixelLimit,
   instances,
+  budgetMs = 0,
+  restart = true,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
@@ -750,6 +752,10 @@ function traverseLodTrees({
       coneFoveate: number;
     }
   >;
+  /** 每片預算(ms);≤ 0 = 原子模式(跑到底)。 */
+  budgetMs?: number;
+  /** true = 丟掉現有 round 從 root 重開。 */
+  restart?: boolean;
 }) {
   const keyInstances = Object.entries(instances);
   const lodIds = new Uint32Array(
@@ -794,6 +800,8 @@ function traverseLodTrees({
     coneFoveates,
     coneFov0s,
     coneFovs,
+    budgetMs,
+    restart,
   ) as {
     instanceIndices: {
       lodId: number;
@@ -802,8 +810,11 @@ function traverseLodTrees({
     }[];
     chunks: [number, number][];
     pixelLimit?: number;
+    done: boolean;
+    slice: number;
+    sliceMs: number;
   };
-  const { instanceIndices, chunks, pixelLimit } = result;
+  const { instanceIndices, chunks, pixelLimit, done, slice, sliceMs } = result;
 
   const indices = keyInstances.reduce(
     (indices, [key, _instance], index) => {
@@ -821,6 +832,9 @@ function traverseLodTrees({
     keyIndices: indices,
     chunks,
     pixelLimit,
+    done,
+    slice,
+    sliceMs,
   };
 }
 
