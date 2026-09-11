@@ -177,9 +177,11 @@ export interface SparkRendererOptions {
      */
     lodRenderScale?: number;
     /**
-     * LoD traverse 時間切片:每片預算(ms)。每片結束把目前的 cut 套到 GPU,下一幀續跑,
-     * 轉頭/走動後 ~一片的時間就有新視角的粗 cut。0 = 關(跑到底才套,v2.1.0 行為)。
-     * @default 40
+     * LoD traverse 時間切片:每片預算(ms)。每片結束把目前的 cut 套到 GPU,下一幀續跑。
+     * 0 = 關閉(v2.1.0 行為:跑到底才套)。給 40 之類的值會啟用切片,但切片對**走路**(姿態持續
+     * 變動)沒有幫助 —— 每次姿態變都從 root 重開、累積不出完整 cut;它只對「靜止 → 轉頭 → 靜止」
+     * 有效。預設關閉,留作 A/B 與增量式 traverse 的地基。
+     * @default 0
      */
     lodSliceMs?: number;
     /**
@@ -372,6 +374,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodSplatCount?: number;
     lodSplatScale: number;
     lodRenderScale: number;
+    /** 切片預算(ms);0 = 關閉(預設,v2.1.0 行為)。切片只對「靜止 → 轉頭 → 靜止」有效,走路情境評估未過,見選項說明。 */
     lodSliceMs: number;
     lodFirstSliceMs: number;
     lodHoldMs: number;
