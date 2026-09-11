@@ -12,7 +12,7 @@ use ahash::AHashSet;
 use glam::{Vec3, Vec3A};
 
 use crate::lod_traverse::{
-    limit_key, expand_until, seed_roots, InstanceParams, TraverseCore, TreeView,
+    compute_pixel_scale, expand_until, limit_key, seed_roots, InstanceParams, TraverseCore, TreeView,
 };
 use crate::lod_splat::LodSplat;
 
@@ -198,6 +198,41 @@ pub(crate) fn bench_main(rounds: usize) {
     eprintln!(
         "MIN of {rounds}: pose0 {:.1} ms  pose1 {:.1} ms  pose2 {:.1} ms  sum {:.1} ms",
         best[0], best[1], best[2], best.iter().sum::<f64>()
+    );
+
+    // ── 方案 B 的成本模型:對現成的 2.5M cut 用新姿態重算 pixel_scale 要多久 ──
+    // (a) cut 只存 paged index,重算時回 `splats[paged]` 讀節點(隨機存取 268MB 陣列)
+    // (b) cut 表自帶節點的 center/size(16B 一筆),順序掃
+    let p0 = params(POSES[0].0, POSES[0].1);
+    let (cut, _) = run_atomic(&splats, &c2p, root_page, p0, 2_500_000);
+    // 用 traverse 產出的順序(兄弟連續),不是排序後的 —— 排序會美化 (a)
+    let trees = [TreeView { lod_id: 1, splats: &splats, chunk_to_page: &c2p, params: p0 }];
+    let mut core = TraverseCore::default();
+    core.reset(2_500_000);
+    seed_roots(&mut core, &trees, &[root_page]);
+    expand_until(&mut core, &trees, 2_500_000, limit_key(PIXEL_SCALE_LIMIT), &mut || false);
+    let order: Vec<u32> = core.snapshot().into_iter().map(|(_, paged)| paged).collect();
+    assert_eq!(order.len(), cut.len());
+    let copied: Vec<LodSplat> = order.iter().map(|&paged| splats[paged as usize].clone()).collect();
+    let p1 = params(POSES[1].0, POSES[1].1);
+    let mut best_a = f64::INFINITY;
+    let mut best_b = f64::INFINITY;
+    let mut sink = 0.0f32;
+    for _ in 0..rounds {
+        let t = Instant::now();
+        for &paged in &order {
+            sink += compute_pixel_scale(&splats[paged as usize], &p1);
+        }
+        best_a = best_a.min(t.elapsed().as_secs_f64() * 1e3);
+        let t = Instant::now();
+        for node in &copied {
+            sink += compute_pixel_scale(node, &p1);
+        }
+        best_b = best_b.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    eprintln!(
+        "RECOMPUTE {} nodes: (a) via splats[paged] {best_a:.1} ms  (b) sequential copy {best_b:.1} ms  (sink {sink:e})",
+        order.len()
     );
 }
 
