@@ -56,6 +56,10 @@ struct LodState {
     lod_trees: AHashMap<u32, LodTree>,
     /// traverse 的跨呼叫狀態(frontier/output/touched);round 存活期間不 clear。
     core: TraverseCore,
+    /// 原子呼叫(`budget_ms <= 0`,如 raycast 那條)專用的第二顆 core。原子路徑**不讀不寫**
+    /// `core` / `round`,所以旁路的原子 traverse 不會打斷切片中的 round(Task 5 review #1:
+    /// `lodRaycast` 預設開、每 500ms 一次,若共用 core 會讓 > 500ms 的 round 永遠跑不完)。
+    scratch: TraverseCore,
     /// 目前這一輪的固定參數;`None` = 沒有在跑的輪。
     round: Option<RoundMeta>,
     buffer: Vec<u32>,
@@ -67,6 +71,7 @@ impl LodState {
             next_id: 1000,
             lod_trees: AHashMap::new(),
             core: TraverseCore::default(),
+            scratch: TraverseCore::default(),
             round: None,
             buffer: Vec::new(),
         }
@@ -262,7 +267,106 @@ pub fn get_lod_tree_level(lod_id: u32, level: u32) -> anyhow::Result<Object, JsV
     })
 }
 
-/// 可續跑的 traverse。`budget_ms <= 0` = 原子(跑到底、清狀態,與 v2.1.0 逐位相同);
+/// 借出各 instance 的樹、拼成迴圈要的唯讀視圖。樹資料借 `lod_trees` **當下**的
+/// (頁面更新可在兩片之間套用,spec §4.5);姿態用呼叫端給的 `params`(續跑時是 round 的)。
+fn build_views<'a>(
+    lod_trees: &'a AHashMap<u32, LodTree>, borrows: &'a [Ref<'a, Vec<LodSplat>>],
+    lod_ids: &[u32], params: &[InstanceParams],
+) -> Vec<TreeView<'a>> {
+    lod_ids.iter().enumerate().map(|(i, id)| TreeView {
+        lod_id: *id,
+        splats: &borrows[i],
+        chunk_to_page: &lod_trees.get(id).unwrap().chunk_to_page,
+        params: params[i],
+    }).collect()
+}
+
+/// 在 `core` 上跑一片:`fresh` 時先 reset + seed roots,再 best-first 展開到 `budget_ms`
+/// 用完(`None` = 跑到底)。回 (迴圈怎麼結束, 這片花了幾 ms)。兩顆 core(切片 / 原子)共用。
+#[allow(clippy::too_many_arguments)]
+fn run_slice(
+    core: &mut TraverseCore, lod_trees: &AHashMap<u32, LodTree>,
+    lod_ids: &[u32], params: &[InstanceParams], root_pages: &[u32],
+    max_splats: usize, pixel_scale_limit: f32, fresh: bool, budget_ms: Option<f32>,
+) -> (LoopExit, f64) {
+    let borrows: Vec<Ref<Vec<LodSplat>>> = lod_ids.iter()
+        .map(|id| lod_trees.get(id).unwrap().splats.borrow())
+        .collect();
+    let trees = build_views(lod_trees, &borrows, lod_ids, params);
+
+    if fresh {
+        core.reset(max_splats);
+        seed_roots(core, &trees, root_pages);
+    }
+
+    // 每 4096 次 pop 才查一次時間(spec D4):跨 wasm→JS 邊界的 Date::now() 不能每個節點都叫。
+    let t0 = js_sys::Date::now();
+    let deadline = budget_ms.map(|b| t0 + b as f64);
+    let mut pops = 0u32;
+    let exit = expand_until(core, &trees, max_splats, pixel_scale_limit, &mut || {
+        pops = pops.wrapping_add(1);
+        pops & 4095 == 0 && deadline.is_some_and(|d| js_sys::Date::now() >= d)
+    });
+    let slice_ms = js_sys::Date::now() - t0;
+    drop(trees);
+    drop(borrows);
+    (exit, slice_ms)
+}
+
+/// 把 `core` 目前的快照(output ∪ frontier,不 drain,spec D3)與累計 touched 打包成 JS 物件。
+fn pack_result(core: &TraverseCore, lod_ids: &[u32], done: bool, slice: u32, slice_ms: f64) -> Object {
+    let num_instances = lod_ids.len();
+    let output_size = core.output.len();
+    let frontier_size = core.frontier.len();
+    let cut = core.snapshot();
+
+    let mut instance_counts = vec![0usize; num_instances];
+    for &(inst_index, _) in cut.iter() {
+        instance_counts[inst_index as usize] += 1;
+    }
+    let mut instance_outputs: Vec<Vec<u32>> = instance_counts.iter().map(|&n| Vec::with_capacity(n)).collect();
+    for &(inst_index, paged_index) in cut.iter() {
+        instance_outputs[inst_index as usize].push(paged_index);
+    }
+
+    let instance_indices = Array::new();
+    for (inst_index, instance_output) in instance_outputs.iter().enumerate() {
+        let rows = instance_output.len().div_ceil(16384);
+        let capacity = rows * 16384;
+        let output = Uint32Array::new_with_length(capacity as u32);
+        output.subarray(0, instance_output.len() as u32).copy_from(instance_output);
+
+        let result = Object::new();
+        Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(lod_ids[inst_index])).unwrap();
+        Reflect::set(&result, &JsValue::from_str("numSplats"), &JsValue::from(instance_output.len() as u32)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("indices"), &JsValue::from(output)).unwrap();
+        instance_indices.push(&JsValue::from(result));
+    }
+
+    // chunks = 本輪**累計**的 touched(不是這片新增的)—— 這是 pager 不釋放 cut 所用頁的前提(spec §4.5)。
+    let out_chunks = Array::new();
+    for &(inst_index, chunk) in core.touched.iter() {
+        let pair = Array::new();
+        pair.push(&JsValue::from(inst_index));
+        pair.push(&JsValue::from(chunk));
+        out_chunks.push(&JsValue::from(pair));
+    }
+
+    let result = Object::new();
+    Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(core.min_pixel_scale)).unwrap();
+    Reflect::set(&result, &JsValue::from_str("instanceIndices"), &JsValue::from(instance_indices)).unwrap();
+    Reflect::set(&result, &JsValue::from_str("chunks"), &JsValue::from(out_chunks)).unwrap();
+    Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(output_size)).unwrap();
+    Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(frontier_size)).unwrap();
+    Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(core.leaf_count)).unwrap();
+    Reflect::set(&result, &JsValue::from_str("done"), &JsValue::from(done)).unwrap();
+    Reflect::set(&result, &JsValue::from_str("slice"), &JsValue::from(slice)).unwrap();
+    Reflect::set(&result, &JsValue::from_str("sliceMs"), &JsValue::from(slice_ms)).unwrap();
+    result
+}
+
+/// 可續跑的 traverse。`budget_ms <= 0` = 原子(在獨立的 `scratch` core 上跑到底,**不碰**
+/// `core` / `round`,與 v2.1.0 逐位相同);`budget_ms > 0` = 切片,在 `core` 上按 `round` 續跑;
 /// `restart` = 丟掉現有 round 從 root 重開。設計見本專案 spec §4。
 #[wasm_bindgen]
 pub fn traverse_lod_trees(
@@ -293,31 +397,47 @@ pub fn traverse_lod_trees(
         return Err(JsValue::from_str("Invalid cone_fovs length"));
     }
 
-    STATE.with_borrow_mut(|state| {
-        let LodState { lod_trees, core, round, .. } = state;
-        let atomic = budget_ms <= 0.0;
-        let fresh = is_fresh(atomic, restart, round.as_ref(), lod_ids);
+    // 這次呼叫自己的姿態 / foveation 參數(切片模式只在 round 開始時算一次、之後沿用 round 的)。
+    let make_params = || -> Vec<InstanceParams> {
+        (0..num_instances).map(|index| {
+            let i16 = index * 16;
+            let forward = glam::Vec3A::from_slice(&view_to_objects[(i16 + 8)..(i16 + 11)]).normalize().map(|x| -x);
+            let origin = glam::Vec3A::from_slice(&view_to_objects[(i16 + 12)..(i16 + 15)]);
+            let cone_dot0 = if cone_fov0s[index] > 0.0 { (0.5 * cone_fov0s[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
+            let cone_dot = if cone_fovs[index] > 0.0 { (0.5 * cone_fovs[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
+            InstanceParams {
+                origin,
+                forward,
+                lod_scale: lod_scales[index],
+                behind_foveate: behind_foveates[index],
+                cone_foveate: cone_foveates[index],
+                cone_dot0,
+                cone_dot: cone_dot.min(cone_dot0),
+            }
+        }).collect()
+    };
 
+    STATE.with_borrow_mut(|state| {
+        let LodState { lod_trees, core, scratch, round, .. } = state;
+
+        if budget_ms <= 0.0 {
+            // 原子模式:自己的參數、自己的 core、跑到底。`core` / `round` 原封不動,
+            // 所以 raycast 那條旁路呼叫不會讓切片中的 round 失效(Task 5 review #1)。
+            let params = make_params();
+            let (exit, slice_ms) = run_slice(
+                scratch, lod_trees, lod_ids, &params, root_pages,
+                max_splats as usize, pixel_scale_limit, true, None,
+            );
+            debug_assert_eq!(exit, LoopExit::Done, "沒有 deadline 的 expand_until 只會以 Done 結束");
+            return Ok(pack_result(scratch, lod_ids, true, 1, slice_ms));
+        }
+
+        // 切片模式。原子已在上面分流,所以 `is_fresh` 的 atomic 項固定給 false。
+        let fresh = is_fresh(false, restart, round.as_ref(), lod_ids);
         if fresh {
-            let params: Vec<InstanceParams> = (0..num_instances).map(|index| {
-                let i16 = index * 16;
-                let forward = glam::Vec3A::from_slice(&view_to_objects[(i16 + 8)..(i16 + 11)]).normalize().map(|x| -x);
-                let origin = glam::Vec3A::from_slice(&view_to_objects[(i16 + 12)..(i16 + 15)]);
-                let cone_dot0 = if cone_fov0s[index] > 0.0 { (0.5 * cone_fov0s[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
-                let cone_dot = if cone_fovs[index] > 0.0 { (0.5 * cone_fovs[index].clamp(0.0, 180.0)).to_radians().cos() } else { 1.0 };
-                InstanceParams {
-                    origin,
-                    forward,
-                    lod_scale: lod_scales[index],
-                    behind_foveate: behind_foveates[index],
-                    cone_foveate: cone_foveates[index],
-                    cone_dot0,
-                    cone_dot: cone_dot.min(cone_dot0),
-                }
-            }).collect();
             *round = Some(RoundMeta {
                 lod_ids: lod_ids.to_vec(),
-                params,
+                params: make_params(),
                 max_splats: max_splats as usize,
                 pixel_scale_limit,
                 slice: 0,
@@ -326,89 +446,14 @@ pub fn traverse_lod_trees(
         }
         let meta = round.as_mut().unwrap();
 
-        // 視圖用 **round 的姿態**(續跑不吃當幀相機),樹資料借 lod_trees 當下的(頁面更新可在兩片之間套用,spec §4.5)。
-        let borrows: Vec<Ref<Vec<LodSplat>>> = meta.lod_ids.iter()
-            .map(|id| lod_trees.get(id).unwrap().splats.borrow())
-            .collect();
-        let trees: Vec<TreeView> = meta.lod_ids.iter().enumerate().map(|(i, id)| TreeView {
-            lod_id: *id,
-            splats: &borrows[i],
-            chunk_to_page: &lod_trees.get(id).unwrap().chunk_to_page,
-            params: meta.params[i],
-        }).collect();
-
-        if fresh {
-            core.reset(meta.max_splats);
-            seed_roots(core, &trees, root_pages);
-        }
-
-        // 每 4096 次 pop 才查一次時間(spec D4):跨 wasm→JS 邊界的 Date::now() 不能每個節點都叫。
-        let t0 = js_sys::Date::now();
-        let deadline = if atomic { None } else { Some(t0 + budget_ms as f64) };
-        let mut pops = 0u32;
-        let exit = expand_until(core, &trees, meta.max_splats, meta.pixel_scale_limit, &mut || {
-            pops = pops.wrapping_add(1);
-            pops & 4095 == 0 && deadline.is_some_and(|d| js_sys::Date::now() >= d)
-        });
+        // 視圖用 **round 的姿態**(續跑不吃當幀相機)。
+        let (exit, slice_ms) = run_slice(
+            core, lod_trees, &meta.lod_ids, &meta.params, root_pages,
+            meta.max_splats, meta.pixel_scale_limit, fresh, Some(budget_ms),
+        );
         meta.slice += 1;
         meta.done = exit == LoopExit::Done;
-        let slice_ms = js_sys::Date::now() - t0;
 
-        let output_size = core.output.len();
-        let frontier_size = core.frontier.len();
-        // 快照 = output ∪ frontier,不 drain(spec D3)。
-        let cut = core.snapshot();
-
-        let mut instance_counts = vec![0usize; num_instances];
-        for &(inst_index, _) in cut.iter() {
-            instance_counts[inst_index as usize] += 1;
-        }
-        let mut instance_outputs: Vec<Vec<u32>> = instance_counts.iter().map(|&n| Vec::with_capacity(n)).collect();
-        for &(inst_index, paged_index) in cut.iter() {
-            instance_outputs[inst_index as usize].push(paged_index);
-        }
-
-        let instance_indices = Array::new();
-        for (inst_index, instance_output) in instance_outputs.iter().enumerate() {
-            let rows = instance_output.len().div_ceil(16384);
-            let capacity = rows * 16384;
-            let output = Uint32Array::new_with_length(capacity as u32);
-            output.subarray(0, instance_output.len() as u32).copy_from(instance_output);
-
-            let result = Object::new();
-            Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(meta.lod_ids[inst_index])).unwrap();
-            Reflect::set(&result, &JsValue::from_str("numSplats"), &JsValue::from(instance_output.len() as u32)).unwrap();
-            Reflect::set(&result, &JsValue::from_str("indices"), &JsValue::from(output)).unwrap();
-            instance_indices.push(&JsValue::from(result));
-        }
-
-        // chunks = 本輪**累計**的 touched(不是這片新增的)—— 這是 pager 不釋放 cut 所用頁的前提(spec §4.5)。
-        let out_chunks = Array::new();
-        for &(inst_index, chunk) in core.touched.iter() {
-            let pair = Array::new();
-            pair.push(&JsValue::from(inst_index));
-            pair.push(&JsValue::from(chunk));
-            out_chunks.push(&JsValue::from(pair));
-        }
-
-        let done = meta.done;
-        let slice = meta.slice;
-        let result = Object::new();
-        Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(core.min_pixel_scale)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("instanceIndices"), &JsValue::from(instance_indices)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("chunks"), &JsValue::from(out_chunks)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(output_size)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(frontier_size)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(core.leaf_count)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("done"), &JsValue::from(done)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("slice"), &JsValue::from(slice)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("sliceMs"), &JsValue::from(slice_ms)).unwrap();
-
-        drop(trees);
-        drop(borrows);
-        if atomic {
-            *round = None;
-        }
-        Ok(result)
+        Ok(pack_result(core, &meta.lod_ids, meta.done, meta.slice, slice_ms))
     })
 }

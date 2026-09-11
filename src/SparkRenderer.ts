@@ -421,7 +421,11 @@ export class SparkRenderer extends THREE.Mesh {
   lodRoundSeq = 0;
   /** 最近結束的一輪。 */
   lastLodRound?: LodRoundStats;
-  /** round 開始時算的位移預測(沿用 v2.1.0 的 deltaPred,updateLodInstances 目前沒用它)。 */
+  /**
+   * round 開始時算的位移預測(沿用 v2.1.0 的 deltaPred,updateLodInstances 目前沒用它)。
+   * ⚠️ `lastTraverseTime` 現在是**一片**的時間而非整輪,所以這個預測是 slice-scaled ——
+   * 誰要重新啟用 `viewPos.add(deltaPred)` 得先換成整輪的時間。
+   */
   private lodDeltaPred = new THREE.Vector3();
   lodInflate: boolean;
   pagedExtSplats: boolean;
@@ -1363,6 +1367,8 @@ export class SparkRenderer extends THREE.Mesh {
           timestamp: roundNow,
         };
         this.lodDirty = false;
+        // 新 round 從 root 重開,updateLodTrees 這幀已經跑過,它看得到那批頁 —— 不必再補 tree 輪
+        this.lodTreeDirty = false;
         if (this.lodRound && !this.lodRound.done) {
           this.finishLodRound(this.lodRound, true);
         }
@@ -1602,7 +1608,8 @@ export class SparkRenderer extends THREE.Mesh {
         maxSplats: Math.min(this.lodRaycast, Math.round(totalLodSplats * 0.1)),
         pixelScaleLimit,
         instances,
-        // 原子模式:它跟主 traverse 共用 Rust 端的 buffer,跑完會把 round 清掉(spec D9)
+        // 原子模式:Rust 端在獨立的 scratch core 上跑到底,不碰切片中的 round
+        // (lodRaycast 預設開、每 500ms 一次,若會清掉 round,> 500ms 的 round 永遠跑不完)
         budgetMs: 0,
         restart: true,
       })) as {
@@ -1612,10 +1619,6 @@ export class SparkRenderer extends THREE.Mesh {
         >;
       };
       const raycastTraverseTime = performance.now() - traverseStart;
-      // Rust 端的 round 已被原子呼叫清掉 —— 下一片必須從 root 重開
-      if (this.lodRound && !this.lodRound.done) {
-        this.lodRound.restart = true;
-      }
 
       const { keyIndices } = result;
       const totalRaycastSplats = Object.values(keyIndices).reduce(

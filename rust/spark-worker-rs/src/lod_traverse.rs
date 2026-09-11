@@ -98,6 +98,8 @@ impl TraverseCore {
 }
 
 /// 這一輪要不要從 root 重開。`lod_ids` 不同 = instance 集合變了,`inst_index` 對不上,視同重開。
+/// `atomic` 項保留(一律重開),但 `lod_tree.rs` 的原子路徑現在走獨立的 scratch core、
+/// 不再經過這裡 —— 切片路徑固定傳 `false`。
 pub(crate) fn is_fresh(atomic: bool, restart: bool, round: Option<&RoundMeta>, lod_ids: &[u32]) -> bool {
     atomic
         || restart
@@ -336,6 +338,52 @@ mod tests {
             let snaps = run(&mut core, &trees, 100, stop_every);
             assert_eq!(sorted(snaps.last().unwrap()), atomic, "stop_every={stop_every}");
         }
+    }
+
+    /// 原子呼叫(raycast)走另一顆 core:切片中的 `core` 暫停 → 另一顆 core 跑原子 →
+    /// `core` 續跑到 Done,最終 cut 必須等於沒被打斷的原子結果(Task 5 review #1 的修法)。
+    #[test]
+    fn atomic_run_on_scratch_core_does_not_disturb_in_flight_round() {
+        let (splats, parent) = build_tree();
+        let c2p = [0u32];
+        let trees = view(&splats, &c2p);
+        let max = 100;
+
+        let mut reference = TraverseCore::default();
+        let expected = sorted(run(&mut reference, &trees, max, 0).last().unwrap());
+
+        // 切片中的 round:跑滿 3 次迭代就暫停
+        let mut core = TraverseCore::default();
+        core.reset(max);
+        seed_roots(&mut core, &trees, &[0]);
+        let mut n = 0u32;
+        let exit = expand_until(&mut core, &trees, max, 0.0, &mut || {
+            n += 1;
+            n > 3
+        });
+        assert_eq!(exit, LoopExit::Paused);
+        let paused_snapshot = core.snapshot();
+        assert_valid_cut(&paused_snapshot, &parent);
+        assert!(paused_snapshot.len() < 64, "暫停時應該還沒展到全部葉子");
+        let paused_frontier = core.frontier.len();
+        let paused_output = core.output.len();
+
+        // 旁路的原子 traverse,在自己的 scratch core 上(不同 max_splats,故意跟 round 不一樣)
+        let mut scratch = TraverseCore::default();
+        let atomic = run(&mut scratch, &trees, 30, 0);
+        assert_eq!(atomic.len(), 1);
+        assert!(atomic[0].len() <= 30);
+
+        // core 原封不動
+        assert_eq!(core.frontier.len(), paused_frontier);
+        assert_eq!(core.output.len(), paused_output);
+        assert_eq!(sorted(&core.snapshot()), sorted(&paused_snapshot));
+
+        // 續跑到底,結果等於沒被打斷
+        let exit = expand_until(&mut core, &trees, max, 0.0, &mut || false);
+        assert_eq!(exit, LoopExit::Done);
+        assert_eq!(sorted(&core.snapshot()), expected);
+        assert_eq!(core.leaf_count, 64);
     }
 
     #[test]

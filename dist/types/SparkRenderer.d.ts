@@ -376,7 +376,11 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodRoundSeq: number;
     /** 最近結束的一輪。 */
     lastLodRound?: LodRoundStats;
-    /** round 開始時算的位移預測(沿用 v2.1.0 的 deltaPred,updateLodInstances 目前沒用它)。 */
+    /**
+     * round 開始時算的位移預測(沿用 v2.1.0 的 deltaPred,updateLodInstances 目前沒用它)。
+     * ⚠️ `lastTraverseTime` 現在是**一片**的時間而非整輪,所以這個預測是 slice-scaled ——
+     * 誰要重新啟用 `viewPos.add(deltaPred)` 得先換成整輪的時間。
+     */
     private lodDeltaPred;
     lodInflate: boolean;
     pagedExtSplats: boolean;
