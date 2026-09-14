@@ -918,7 +918,16 @@ impl IncrementalCut {
             && (self.cut_size as f32) < 0.98 * self.max_splats as f32
             && !self.misfit_pinned
         {
-            self.t = (self.t * 0.9).max(limit);
+            // 衰減步幅依「離預算還有多遠」自適應(spec §4.5 amendment,手測 2026-09-14):固定 0.9
+            // 在停下後要 3–4 個 pass(~800ms)才填滿預算,肉眼看到分波次變細(將軍府桌機實測
+            // `settleMs.median` 815ms)。表面型資料 ps > t 的節點數大略隨 t^-2 成長,所以「一步就
+            // 填滿預算」的係數 ≈ sqrt(cut_size / max_splats)——目前 cut 離飽和(0.98·max)還有多遠,
+            // 開根號後就是那一步該乘的比例。`clamp(0.5, 0.97)`:下限 0.5 防止 cut 幾乎是空的時候
+            // (fill 很小)一步衝到 `limit`、瞬間把一大片 misfit 節點打開;上限 0.97 保證即使已經
+            // 到 97% 滿,這一步仍然有實質推進(不會退化成幾乎不動)。
+            let fill = self.cut_size as f32 / self.max_splats as f32;
+            let factor = fill.sqrt().clamp(0.5, 0.97);
+            self.t = (self.t * factor).max(limit);
         }
         if self.t < limit {
             self.t = limit;
@@ -1245,6 +1254,55 @@ mod tests {
         settle(&mut cut, &trees, 30, limit, 0.0);         // 拉近 + 預算 30:拆到 28
         assert_eq!(cut_indices(&cut), atomic);
         assert_valid(&cut, &parent);
+    }
+
+    /// spec §4.5 amendment(手測 2026-09-14,將軍府桌機 settleMs.median 815ms):衰減步幅改依
+    /// `sqrt(cut_size / max_splats)`(clamp 0.5–0.97)取代固定 0.9。先在小預算(30)把 t misfit-pin
+    /// 住,再把預算放大到 1000(cut 相對新預算的 fill = 28/1000 → 開根號後夾在下限 0.5)—— 固定 0.9
+    /// 規則下這一個 tick 後 t 只會降到 0.9×t_before(RED);自適應規則應該一次就降到 ≤0.5×t_before
+    /// (斷言留 0.6× 當寬容邊界)。
+    #[test]
+    fn inc_decay_step_scales_with_fill() {
+        let (splats, _parent) = build_tree();
+        let c2p = [0u32];
+        let limit = 0.03;
+        let near = pose(Vec3A::new(3.0, 0.0, -50.0));
+        let trees = views_p(&splats, &c2p, near);
+
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], limit);
+        settle(&mut cut, &trees, 30, limit, 0.0);
+        assert_eq!(cut.cut_size, 28, "小預算應收斂在 28(同 inc_equals_atomic_with_budget)");
+        let t_before = cut.t;
+        assert!(t_before > limit, "misfit 應把 t 頂在 limit 之上:t={t_before} limit={limit}");
+
+        // 預算 30 → 1000:max_splats 變動觸發 params 改變分支,misfit_pinned 解除、heap 清空、
+        // visited_since_change 歸零 —— 緊接著這一個 tick(無 deadline)會掃完整輪,重新確認同一個
+        // misfit 候選(ps 剛好等於 t_before,不大於 up,所以不會被重新展開)後落進門檻控制器的衰減
+        // 分支。這一 tick 把 `limit` 一併降到 0(而非沿用 0.03)——只是為了不讓「下限夾住」
+        // (`t = t.max(limit)`)蓋掉衰減係數本身的效果,好單獨驗證 `sqrt(fill)` 那一步;不影響
+        // 前面已經用 limit=0.03 收斂出的 t_before/cut_size(那兩個值在這個 tick 開頭就已經固定)。
+        let cut_size_before = cut.cut_size;
+        let _st = cut.tick(&trees, &[0], 1000, 0.0, 0.0, &mut || false, &mut || false);
+        assert_eq!(
+            cut.cut_size, cut_size_before,
+            "這個 tick 內不應該真的展開(misfit 候選 ps == t_before,不大於 up,不會重新排隊)"
+        );
+        let fill = cut_size_before as f32 / 1000.0;
+        let expected_factor = fill.sqrt().clamp(0.5, 0.97);
+        assert!((expected_factor - 0.5).abs() < 1e-6, "fill={fill} 應該夾在下限 0.5");
+        assert!(
+            (cut.t - t_before * expected_factor).abs() < 1e-6,
+            "衰減後的 t 應該精確等於 t_before × clamp(sqrt(fill), 0.5, 0.97):t={} 預期={}",
+            cut.t,
+            t_before * expected_factor
+        );
+        assert!(
+            cut.t <= 0.6 * t_before,
+            "自適應衰減應一步大幅逼近 limit:t_before={t_before} t={} (0.6×t_before={})",
+            cut.t,
+            0.6 * t_before
+        );
     }
 
     /// deadline 每筆就停:每個 tick 之後都是合法 cut、不超預算,最終仍收斂到原子。
