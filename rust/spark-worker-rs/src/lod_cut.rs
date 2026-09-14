@@ -24,6 +24,13 @@ pub(crate) const NONE: u32 = u32::MAX;
 pub(crate) const CUT_LEAF: u32 = u32::MAX - 1;
 /// arena:沒展開、樹葉(不能拆;收由 parent 決定)。
 pub(crate) const CUT_TERMINAL: u32 = u32::MAX - 2;
+/// arena:CUT_LEAF 目前正排在 `expand_heap` 裡等展開(Task 5 review round 1 的去重 sentinel)——
+/// 冷啟動時同一批候選會被連續好幾個 tick 的掃描重複 push,heap 灌到幾百萬筆重複項,
+/// push/pop 越拖越慢(這正是「tick 20ms → 150–210ms」的根因)。掃描端看到 `!= CUT_LEAF` 會跳過
+/// 已排隊的孩子,不再重推;pop 出來處理完(展開成功/終止/裝不下/不 resident)才視情況還原成
+/// `CUT_LEAF`(見 `tick()` 內對應分支的註解)。這裡的「處理」語意上等同 `CUT_LEAF`——`pack()`/
+/// `cut_set_for_test()` 都要把它當 cut 的一員(還沒展開,只是恰好正在排隊)。
+pub(crate) const CUT_QUEUED: u32 = u32::MAX - 3;
 /// arena free list 的分桶上限(child_count ≤ 32 進桶;更大的 bump 配置、釋放只計數,spec D16)。
 const ARENA_BUCKETS: usize = 33;
 /// 掃描 / 拆時每幾筆查一次 deadline(A 的 D4)。
@@ -50,6 +57,9 @@ pub(crate) struct Node {
     /// pack 發現孩子頁被踢 → 下一 tick 無視 ps 收回(spec §4.4)。
     pub(crate) forced: bool,
     pub(crate) alive: bool,
+    /// 目前正排在 `collapse_heap` 裡等收(`CUT_QUEUED` 的 interior 版去重 sentinel,
+    /// 同一顆理由見 `CUT_QUEUED` 的文件註解)。pop 時(不論有沒有真的收)重設回 `false`。
+    pub(crate) queued: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -337,6 +347,7 @@ impl IncrementalCut {
                 child_size_max: root.size,
                 forced: false,
                 alive: true,
+                queued: false,
             });
             self.roots.push(slot);
             self.refs_add(inst as u8, 0, 1);
@@ -346,8 +357,11 @@ impl IncrementalCut {
 
     // ── expand / collapse ───────────────────────────────────────────────────
 
-    /// 把 `slot` 的第 `i` 個孩子(必須是 CUT_LEAF 或 CUT_TERMINAL)拆成它的孩子。`ps` 是呼叫端算好的該孩子 ps
-    /// (成為新 Node 的 `ps`,也是 `wanted` 的優先序)。
+    /// 把 `slot` 的第 `i` 個孩子(必須是 CUT_LEAF / CUT_TERMINAL / CUT_QUEUED)拆成它的孩子。`ps` 是
+    /// 呼叫端算好的該孩子 ps(成為新 Node 的 `ps`,也是 `wanted` 的優先序)。
+    /// ⚠️ 透過 `tick()` 的 heap 呼叫時,arena 這格此刻通常是 `CUT_QUEUED`(pop 出來還沒被重設回
+    /// `CUT_LEAF`——見 `CUT_QUEUED` 的文件註解);測試直接呼叫 `expand()` 則多半是 `CUT_LEAF`。
+    /// 兩者對這個函式語意相同。
     pub(crate) fn expand(&mut self, trees: &[TreeView], slot: u32, i: u16, ps: f32, max_splats: usize) -> ExpandOutcome {
         let node = self.nodes[slot as usize];
         debug_assert!(node.alive && i < node.child_count);
@@ -359,8 +373,8 @@ impl IncrementalCut {
         // 所以這裡可能已經是 CUT_TERMINAL(例如剛好是葉);唯一不合法的是已經展開過
         // (arena 存的是真的 Node slot)。
         debug_assert!(
-            matches!(self.arena[arena_i].slot, CUT_LEAF | CUT_TERMINAL),
-            "expand 只能作用在還沒展開的孩子(CUT_LEAF/CUT_TERMINAL),而不是已展開的 Node slot"
+            matches!(self.arena[arena_i].slot, CUT_LEAF | CUT_TERMINAL | CUT_QUEUED),
+            "expand 只能作用在還沒展開的孩子(CUT_LEAF/CUT_TERMINAL/CUT_QUEUED),而不是已展開的 Node slot"
         );
 
         let Some(child) = Self::splat_at(tree, child_index) else {
@@ -415,6 +429,7 @@ impl IncrementalCut {
             child_size_max,
             forced: false,
             alive: true,
+            queued: false,
         });
         self.arena[arena_i].slot = new_slot;
         self.nodes[slot as usize].expanded += 1;
@@ -489,7 +504,9 @@ impl IncrementalCut {
             let tree = &trees[node.inst as usize];
             for i in 0..node.child_count as u32 {
                 let c = self.arena[(node.children_base + i) as usize];
-                if c.slot != CUT_LEAF && c.slot != CUT_TERMINAL {
+                // CUT_QUEUED 只是「正排隊等展開」,還沒真的展開——對 pack 而言它跟 CUT_LEAF
+                // 是同一件事:仍在 cut 裡,要輸出。
+                if c.slot != CUT_LEAF && c.slot != CUT_TERMINAL && c.slot != CUT_QUEUED {
                     continue;
                 }
                 let index = node.child_start + i;
@@ -570,6 +587,35 @@ impl IncrementalCut {
             && self.forced.is_empty() && self.cut_size <= self.max_splats
     }
 
+    /// 整批丟棄 `expand_heap`(門檻/params 變了、或消費端判斷剩下的都不用看了)。丟棄前把還沒被
+    /// pop 處理過的候選(arena 那格仍是 `CUT_QUEUED`)還原成 `CUT_LEAF`——不然 heap 一清空,
+    /// 這些孩子就永遠卡在 `CUT_QUEUED`:掃描端看到「不是 CUT_LEAF」會跳過、不會重新排隊,而
+    /// heap 裡已經沒有任何條目會在未來把它 pop 回來。只在「node 還活著、index 對得上」才動
+    /// arena(否則那格可能已經被別的孩子重用,見 `Child`/`Node` 的重用機制)。
+    fn clear_expand_heap(&mut self) {
+        for &(_, slot, i, index) in self.expand_heap.iter() {
+            let node = self.nodes[slot as usize];
+            if node.alive && node.index == index {
+                let arena_i = (node.children_base + i as u32) as usize;
+                if self.arena[arena_i].slot == CUT_QUEUED {
+                    self.arena[arena_i].slot = CUT_LEAF;
+                }
+            }
+        }
+        self.expand_heap.clear();
+    }
+
+    /// `clear_expand_heap` 的 interior 版:丟棄前把還沒 pop 的候選的 `Node.queued` 還原成 `false`。
+    fn clear_collapse_heap(&mut self) {
+        for &Reverse((_, slot, index)) in self.collapse_heap.iter() {
+            let node = self.nodes[slot as usize];
+            if node.alive && node.index == index {
+                self.nodes[slot as usize].queued = false;
+            }
+        }
+        self.collapse_heap.clear();
+    }
+
     /// 一次 worker 呼叫的工作(spec §4.2)。掃描階段跑到 `scan_deadline`(預算的 60%,免得掃描把
     /// 時間吃光、拆收永遠輪不到),其餘階段跑到 `deadline`;任一回 true 就停,狀態永遠合法。
     /// 介面由 spec §4.8 / task brief 指定,參數不可減——同 `lod_tree.rs` 的 `traverse_lod_trees` 先例。
@@ -590,8 +636,8 @@ impl IncrementalCut {
             self.visited_since_change = 0;
             // M5:params/max/limit 變了,heap 裡按舊門檻排的候選(ps 與其優先序)全部作廢,清掉
             // 免得之後用舊 ps 誤判(消費端不會重算 heap 裡存的 ps)。
-            self.expand_heap.clear();
-            self.collapse_heap.clear();
+            self.clear_expand_heap();
+            self.clear_collapse_heap();
             // 同理:之前 misfit 頂住的「已確認裝不下」對新的 params/max/limit 不再有意義
             // (尤其是 max_splats 變大——原本裝不下的,現在可能裝得下,該讓衰減重新探)。
             self.misfit_pinned = false;
@@ -660,19 +706,27 @@ impl IncrementalCut {
             if !skip_children {
                 for i in 0..node.child_count as usize {
                     let c = self.arena[base + i];
+                    // c.slot != CUT_LEAF 同時濾掉「已展開」「CUT_TERMINAL」「已經在 expand_heap 排隊
+                    // 的 CUT_QUEUED」——去重的關鍵:冷啟動連續好幾個 tick 掃到同一批孩子時,不會
+                    // 每次都重推同一筆進 heap(這正是 review round 1 抓到的 heap 無限膨脹根因)。
                     if c.slot != CUT_LEAF {
                         continue;
                     }
                     let ps = Self::ps_of(c.center, c.size, p);
                     if ps > up {
                         self.expand_heap.push((OrderedFloat(ps), slot, i as u16, node.index));
+                        self.arena[base + i].slot = CUT_QUEUED;
                     }
                 }
             } else {
                 st.bound_skipped += 1;
             }
-            if node.parent != NONE && node.expanded == 0 && (node_ps <= down || node_ps <= limit_down || over_budget) {
+            // `!node.queued`:同理,已經在 collapse_heap 排隊的 interior 不重推。
+            if node.parent != NONE && node.expanded == 0 && !node.queued
+                && (node_ps <= down || node_ps <= limit_down || over_budget)
+            {
                 self.collapse_heap.push(Reverse((OrderedFloat(node_ps), slot, node.index)));
+                self.nodes[slot as usize].queued = true;
             }
         }
         // 掃到 n 筆但沒 wrap(cursor == n)的話,下一 tick 開頭才會真正 wrap、bump `passes`。
@@ -704,11 +758,17 @@ impl IncrementalCut {
             // 直接丟掉、永遠沒機會收。加回 `ps <= down`,掃描端跟消費端的判準才一致(`t ≥ limit` 恆成立,
             // 故 `down ≥ limit_down`,兩個條件都留著只是寫清楚,不是必要的邏輯 OR 化簡)。
             if !(over || ps <= down || ps <= limit_down) {
-                self.collapse_heap.clear(); // 剩下的 ps 都更大、三個條件對它們同樣不成立(同 expand_heap 的對稱處理)
+                self.clear_collapse_heap(); // 剩下的 ps 都更大、三個條件對它們同樣不成立(同 expand_heap 的對稱處理)
                 break;
             }
             self.collapse_heap.pop();
             let node = self.nodes[slot as usize];
+            // 不論這筆最後是不是過期(下面的 continue),只要 node 還活著、index 對得上,先把
+            // `queued` 還原成 false——它已經離開 heap 了,不管有沒有真的被收都該讓它有機會
+            // 之後被重新排隊(否則 `!node.queued` 的去重守衛會永遠擋住它)。
+            if node.alive && node.index == index {
+                self.nodes[slot as usize].queued = false;
+            }
             if !node.alive || node.index != index || node.expanded != 0 {
                 continue; // lazy:候選過期
             }
@@ -718,13 +778,15 @@ impl IncrementalCut {
                     last_collapsed_ps = Some(ps);
                 }
                 // 連收多層:parent 可能因此成為候選。M1:超預算時也要推(同 D20,不能只靠 ps 掉到門檻以下),
-                // 用剛收完之後的最新 cut_size(collapse() 內已經減過)判斷。
+                // 用剛收完之後的最新 cut_size(collapse() 內已經減過)判斷。`!parent.queued`:parent
+                // 可能已經因為別的理由排在 collapse_heap 裡,不要重複推。
                 let parent = self.nodes[node.parent as usize];
-                if parent.parent != NONE && parent.expanded == 0 {
+                if parent.parent != NONE && parent.expanded == 0 && !parent.queued {
                     let pps = Self::ps_of(parent.center, parent.size, &trees[parent.inst as usize].params);
                     self.nodes[node.parent as usize].ps = pps;
                     if pps <= down || pps <= limit_down || self.cut_size > self.max_splats {
                         self.collapse_heap.push(Reverse((OrderedFloat(pps), node.parent, parent.index)));
+                        self.nodes[node.parent as usize].queued = true;
                     }
                 }
             }
@@ -744,12 +806,14 @@ impl IncrementalCut {
             let up_now = self.t * (1.0 + eps);
             while let Some(&(OrderedFloat(ps), slot, i, index)) = self.expand_heap.peek() {
                 if ps <= up_now {
-                    self.expand_heap.clear(); // 剩下的都更小
+                    self.clear_expand_heap(); // 剩下的都更小
                     break;
                 }
                 self.expand_heap.pop();
                 let node = self.nodes[slot as usize];
-                if !node.alive || node.index != index || self.arena[(node.children_base + i as u32) as usize].slot != CUT_LEAF {
+                // 有效候選此刻應該是 CUT_QUEUED(掃描/連鎖推進時已經把它從 CUT_LEAF 改過去);
+                // 不是就代表過期(node 已死、index 不符,或這格已經被別的路徑處理掉了)。
+                if !node.alive || node.index != index || self.arena[(node.children_base + i as u32) as usize].slot != CUT_QUEUED {
                     continue; // lazy:候選過期
                 }
                 match self.expand(trees, slot, i, ps, self.max_splats) {
@@ -763,16 +827,33 @@ impl IncrementalCut {
                                 let cps = Self::ps_of(c.center, c.size, p);
                                 if cps > up_now {
                                     self.expand_heap.push((OrderedFloat(cps), new_slot, g as u16, nn.index));
+                                    self.arena[nn.children_base as usize + g].slot = CUT_QUEUED;
                                 }
                             }
                         }
                     }
                     ExpandOutcome::Misfit(_) => {
                         misfit_ps = Some(ps);
-                        self.expand_heap.clear();
+                        // 沒展開成功:這個孩子還是 CUT_LEAF(只是還沒被拆),expand() 對
+                        // Misfit/NotResident 兩種結果都不會動 arena 那格,得在這裡自己還原,
+                        // 不然它會帶著 CUT_QUEUED 被 clear_expand_heap 之後的下個 tick 永久跳過。
+                        let arena_i = (self.nodes[slot as usize].children_base + i as u32) as usize;
+                        if self.arena[arena_i].slot == CUT_QUEUED {
+                            self.arena[arena_i].slot = CUT_LEAF;
+                        }
+                        self.clear_expand_heap();
                         break;
                     }
-                    ExpandOutcome::NotResident | ExpandOutcome::Terminal => {}
+                    ExpandOutcome::NotResident => {
+                        // 同上:expand() 沒動這格,自己還原成 CUT_LEAF。
+                        let arena_i = (self.nodes[slot as usize].children_base + i as u32) as usize;
+                        if self.arena[arena_i].slot == CUT_QUEUED {
+                            self.arena[arena_i].slot = CUT_LEAF;
+                        }
+                    }
+                    ExpandOutcome::Terminal => {
+                        // expand() 已經把這格寫成 CUT_TERMINAL(不是 CUT_LEAF),不用也不該還原。
+                    }
                 }
                 expansions += 1;
                 if expansions % self.deadline_stride == 0 && deadline() {
@@ -837,12 +918,19 @@ impl IncrementalCut {
             }
             for i in 0..node.child_count as u32 {
                 let c = self.arena[(node.children_base + i) as usize];
-                if c.slot == CUT_LEAF || c.slot == CUT_TERMINAL {
+                if c.slot == CUT_LEAF || c.slot == CUT_TERMINAL || c.slot == CUT_QUEUED {
                     out.push((node.inst, node.child_start + i));
                 }
             }
         }
         out
+    }
+
+    /// 測試用:(expand_heap.len(), collapse_heap.len())——驗證去重之後 heap 不會隨 tick 數線性
+    /// 累積(Task 5 review round 1 的 `inc_heaps_do_not_accumulate_duplicates`)。
+    #[cfg(test)]
+    pub(crate) fn heap_lens_for_test(&self) -> (usize, usize) {
+        (self.expand_heap.len(), self.collapse_heap.len())
     }
 }
 
@@ -1150,6 +1238,71 @@ mod tests {
         }
         assert!(ticks > 5, "每筆就停,應該要很多 tick:{ticks}");
         assert_eq!(cut_indices(&cut), atomic_cut(&splats, &p, limit, 30));
+    }
+
+    /// Task 5 review round 1(去重 sentinel `CUT_QUEUED` / `Node.queued`)的回歸測試。
+    ///
+    /// 根因:掃描每 tick 都會重新檢查每個活著的 interior,修去重之前,同一批還沒展開的
+    /// `CUT_LEAF` 孩子(或還沒收的 interior)會被**連續好幾個 tick 重複 push** 進
+    /// `expand_heap`/`collapse_heap`——冷啟動(`walk_main` station 0)量到的 tick 20ms →
+    /// 150–210ms 就是這樣堆出來的:heap 灌到幾百萬筆重複項,push/pop 越拖越慢,lazy
+    /// 驗證也跟著 pop 出大量早就過期的垃圾。
+    ///
+    /// ⚠️ **跟 review 原始建議的參數不同,這裡是量出來才定案的**:一開始照 review 字面
+    /// (`deadline_stride = 1` + 兩個 deadline 閉包共用一個「第 2 次呼叫才喊停」的計數,跟
+    /// `inc_every_tick_is_valid_cut` 同款)在 `build_tree()`(85 個 splat、深度 3、分支 4)上
+    /// 量,修去重前後的 heap 峰值分別是 87(nodes=13)vs 16(nodes=6)——去重確實有效
+    /// (差近 10×),但兩者都遠低於 review 給的界線 `nodes.len()*8+8`,**斷言在修去重前
+    /// 也不會炸**,不是能為假的判準。根因:那組共用計數把「掃描」跟「拆收」同等地掐到
+    /// 幾乎不動,而這棵測試樹的候選總量被 85 個 splat 這個上限鎖死,重複項來不及在
+    /// 樹被掃完之前疊到界線之上。
+    ///
+    /// 改成**掃描給滿、拆收極緊**(`scan_deadline` 永遠不喊停 = 每 tick 都掃完整輪
+    /// 重新排隊;`deadline` 第一次呼叫就喊停 = 每 tick 最多前進 1 個展開/收——`tick()` 的
+    /// 結構保證「至少處理 1 筆才查 deadline」,這是拆收能拿到的最小預算),精確對應
+    /// `walk_main` 冷啟動的真實失衡(掃描 12ms 通常掃得完一輪、拆收 8ms 吃不完全部候選)。
+    /// 同一棵樹下重新量:去重前 tick3 就到 20(nodes=4,超過下面門檻的 16);去重後全程
+    /// ≤ 16(nodes=6 時的峰值),兩者都在此測試檔案裡跑過、非事後空想——peak ratio(heap/
+    /// nodes)去重前 ≈8.1、去重後 ≈2.67,門檻 `nodes.len()*4+4` 卡在中間,留了約 1.5×
+    /// 安全邊界給去重後的路徑,同時讓去重前在第 3–4 tick 就假不了。
+    #[test]
+    fn inc_heaps_do_not_accumulate_duplicates() {
+        let (splats, _) = build_tree();
+        let c2p = [0u32];
+        let limit = 0.03;
+        let max = 1000;
+        let p = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let trees = views_p(&splats, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], limit);
+        cut.deadline_stride = 1;
+        let mut ticks = 0;
+        let mut settled_early = false;
+        for _ in 0..30 {
+            // 掃描:永遠不喊停(每 tick 都掃完整輪,舊候選會被重新檢查)。
+            // 拆收:第一次查就喊停——`tick()` 內部是「先做 1 筆才查 deadline」,這是能給
+            // 拆收的最小預算,模擬「掃描吃得完、拆收吃不完」的失衡。
+            let st = cut.tick(&trees, &[0], max, limit, 0.0, &mut || false, &mut || true);
+            ticks += 1;
+            let (expand_len, collapse_len) = cut.heap_lens_for_test();
+            // 有界:見上面函式文件的量測——修去重前這裡在 tick 3–4 就會炸(20/4 超過
+            // 4*4+4=20 一點點、tick4 的 31/5 遠超 5*4+4=24),修去重後全程留有安全邊界。
+            assert!(
+                expand_len + collapse_len <= cut.nodes.len() * 4 + 4,
+                "tick {ticks}: expand_heap {expand_len} + collapse_heap {collapse_len} = {} \
+                 超過候選數上界(nodes.len()={})——去重失效,重複項正在累積",
+                expand_len + collapse_len, cut.nodes.len()
+            );
+            if ticks <= 5 && st.settled {
+                settled_early = true;
+            }
+            if st.settled {
+                break;
+            }
+            assert!(ticks < 500, "不收斂");
+        }
+        assert!(!settled_early, "前 5 tick 內就 settled,量不到冷啟動累積階段,測試沒有覆蓋到目標場景");
+        assert!(ticks > 5, "應該要很多 tick 才 settled(才有機會觀察到 heap 是否累積):{ticks}");
     }
 
     /// 遲滯:z=-100、limit 0.04 時 L1 的 ps ≈ 0.0399(貼著門檻)。先在 limit 0.03 建到 L2,

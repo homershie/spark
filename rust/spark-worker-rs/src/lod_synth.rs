@@ -239,10 +239,19 @@ pub(crate) fn bench_main(rounds: usize) {
 /// 方案 B 的走路模擬:20 站、每站位移 0.05 單位 + 轉 1°,每站 tick(20ms 預算)到 settled。
 /// 印每 tick 的 ms(tick / pack 分開)、每站 settle 的 tick 數、拆收數。目標:tick ≤ 30ms、settle ≤ 6 tick。
 /// worker crate 的 test build 不呼叫它(只有 `traverse-bench` 用 `#[path]` include 後在 `main` 呼叫)。
+///
+/// ⚠️ **station 0 是冷啟動,不是缺陷**(Task 5 review round 1):空 cut 直接跳到第一個姿態,
+/// 工作量等同一次完整的原子 traverse(2.5M 預算全部要從無到有拆出來),需要 50+ tick 是預期
+/// 行為。給它自己的上限(400 tick,一般站的 60 遠遠不夠它收斂)與獨立計數
+/// (`COLD START: N ticks`),**不**計進 `settle ticks` 的 median/max、也**不**計進
+/// `all_tick`/`all_pack`(這兩份統計代表「走路中途轉頭一次」的穩態成本,冷啟動混進去會把
+/// p90 拉到失真)。
 #[allow(dead_code)]
 pub(crate) fn walk_main(rounds: usize) {
     use crate::lod_cut::IncrementalCut;
     use std::time::Instant;
+    const COLD_START_TICK_CAP: u32 = 400;
+    const NORMAL_TICK_CAP: u32 = 60;
     let tree = build_synth(7, 256 * CHUNK, 256.0);
     let (splats, c2p, root_page) = page_out(&tree);
     let mut cut = IncrementalCut::new();
@@ -253,10 +262,13 @@ pub(crate) fn walk_main(rounds: usize) {
     let mut all_tick = Vec::new();
     let mut all_pack = Vec::new();
     let mut settle_ticks = Vec::new();
+    let mut cold_start_tick: Vec<f64> = Vec::new();
     // 最後一站實際用來 tick 的姿態(推進之前存起來,見 task brief 的提醒:
     // 推進之後的 origin/yaw 不是最後一站 tick 時用的那個,Jaccard 會量錯東西)。
     let mut last = (origin, yaw);
     for station in 0..(20 * rounds) {
+        let cold_start = station == 0;
+        let tick_cap = if cold_start { COLD_START_TICK_CAP } else { NORMAL_TICK_CAP };
         let forward = Vec3A::new(yaw.sin(), 0.0, yaw.cos());
         let trees = [TreeView { lod_id: 1, splats: &splats, chunk_to_page: &c2p, params: params(origin, forward) }];
         let mut ticks = 0;
@@ -269,16 +281,26 @@ pub(crate) fn walk_main(rounds: usize) {
             let t2 = Instant::now();
             let packed = if cut.needs_pack() { Some(cut.pack(&trees)) } else { None };
             let pack_ms = t2.elapsed().as_secs_f64() * 1e3;
-            all_tick.push(tick_ms);
-            if packed.is_some() { all_pack.push(pack_ms); }
             ticks += 1;
+            if cold_start {
+                cold_start_tick.push(tick_ms);
+            } else {
+                all_tick.push(tick_ms);
+                if packed.is_some() { all_pack.push(pack_ms); }
+            }
             if station < 2 || ticks <= 2 {
                 eprintln!("station {station} tick {ticks}: tick {tick_ms:6.1} ms pack {pack_ms:5.1} ms  cut {}  exp {} col {} t {:.3e} settled {}",
                     st.cut_size, st.expanded, st.collapsed, st.t, st.settled);
             }
-            if st.settled || ticks >= 60 { break; }
+            if st.settled || ticks >= tick_cap { break; }
         }
-        settle_ticks.push(ticks);
+        if cold_start {
+            let med = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+            eprintln!("COLD START: {ticks} ticks (tick median {:.1} ms, excluded from WALK: stats below)",
+                med(&mut cold_start_tick.clone()));
+        } else {
+            settle_ticks.push(ticks);
+        }
         last = (origin, yaw);
         origin += Vec3A::new(0.05 * yaw.cos(), 0.0, -0.05 * yaw.sin());
         yaw += 1.0f32.to_radians();
