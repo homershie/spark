@@ -448,10 +448,10 @@ export class SparkRenderer extends THREE.Mesh {
   lodWorker: SplatWorker | null = null;
   /**
    * 上一幀參與 LoD 的 mesh 與「預期的 version」;driveLod 用 `mesh.version > 記錄值` 判髒。
-   * ⚠️ `updateLodIndices` 套用一片時自己會 bump version(+1,下一幀 accumulator 看到 numSplats
-   * 變了再 +1),那裡會把記錄提到 `mesh.version + 1` 讓自己的 bump 不算髒 —— 否則每套用一片
-   * 就自己標髒、round 永遠跑不完。附帶效果:原子模式(lodSliceMs = 0)站著不動時也不再每幀
-   * 無止境重跑 traverse(v2.1.0 是會的,只是原子之下看不出來)。
+   * ⚠️ `updateLodIndices` 套用一次索引時自己會 bump version(+1,下一幀 accumulator 看到
+   * numSplats 變了再 +1),那裡會把記錄提到 `mesh.version + 1` 讓自己的 bump 不算髒 ——
+   * 否則每套用一次就自己標髒、needTick 永遠是 true。附帶效果:原子模式(`lodIncremental = false`)
+   * 站著不動時也不再每幀無止境重跑 traverse(v2.1.0 是會的)。
    */
   lodMeshes: { mesh: SplatMesh; version: number }[] = [];
   lodDirty = false;
@@ -1416,8 +1416,7 @@ export class SparkRenderer extends THREE.Mesh {
         const lodUpdates = this.lodUpdates;
         this.lodUpdates = [];
         await worker.call("updateLodTrees", { ranges: lodUpdates });
-        // 切片之下頁面更新不再直接重算(每批頁都 restart 會讓 round 永遠跑不完):
-        // 記下來,這輪跑完再補一輪。新到的頁對這輪後續的展開已經立即可用。
+        // 標髒、下面的 needTick 會補一次 tick;新到的頁對本次 tick 後續的展開已經立即可用。
         this.lodTreeDirty = true;
       }
 
@@ -1842,8 +1841,8 @@ export class SparkRenderer extends THREE.Mesh {
       }
       mesh.updateMappingVersion();
       // 我們自己改了 numSplats:這一下 +1、下一幀 accumulator 看到 numSplats 變了還會再 +1。
-      // 把記錄提到「現在 + 1」,否則每套用一片就被自己標髒、round 永遠跑不完(spec §5 的 meshVersion 迴圈)。
-      // 外部真正的變更(在這之上再 +1)仍會被判髒。
+      // 把記錄提到「現在 + 1」,否則每套用一次就被自己標髒、needTick 永遠是 true(spec §5 的
+      // meshVersion 迴圈)。外部真正的變更(在這之上再 +1)仍會被判髒。
       const rec = this.lodMeshes.find((r) => r.mesh === mesh);
       if (rec) rec.version = mesh.version + 1;
     }
