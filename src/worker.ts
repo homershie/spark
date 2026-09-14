@@ -727,13 +727,31 @@ function updateLodTrees({
   );
 }
 
+/** 增量 tick(方案 B)的讀數;原子路徑(`incremental=false` 或 `budgetMs≤0`)不回這個物件。 */
+export type LodTickStats = {
+  scanned: number;
+  expanded: number;
+  collapsed: number;
+  passes: number;
+  settled: boolean;
+  evicted: number;
+  wantedCount: number;
+  cutSize: number;
+  t: number;
+  arenaLeaked: number;
+  changed: boolean;
+  tickMs: number;
+  boundSkipped: number;
+};
+
 function traverseLodTrees({
   maxSplats,
   pixelScaleLimit,
   lastPixelLimit,
   instances,
   budgetMs = 0,
-  restart = true,
+  incremental = false,
+  hysteresis = 0,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
@@ -752,10 +770,12 @@ function traverseLodTrees({
       coneFoveate: number;
     }
   >;
-  /** 每片預算(ms);≤ 0 = 原子模式(跑到底)。 */
+  /** tick 時間預算(ms);≤ 0 = 原子(跑到底)。 */
   budgetMs?: number;
-  /** true = 丟掉現有 round 從 root 重開。 */
-  restart?: boolean;
+  /** true = 增量 cut(方案 B);false = 每次從 root 原子重走(v2.1.0 行為,A/B 對照)。 */
+  incremental?: boolean;
+  /** 拆 / 收的遲滯 ε(0..1)。 */
+  hysteresis?: number;
 }) {
   const keyInstances = Object.entries(instances);
   const lodIds = new Uint32Array(
@@ -801,40 +821,48 @@ function traverseLodTrees({
     coneFov0s,
     coneFovs,
     budgetMs,
-    restart,
+    incremental,
+    hysteresis,
   ) as {
-    instanceIndices: {
-      lodId: number;
-      numSplats: number;
-      indices: Uint32Array;
-    }[];
+    instanceIndices:
+      | {
+          lodId: number;
+          numSplats: number;
+          indices: Uint32Array;
+        }[]
+      | null;
     chunks: [number, number][];
     pixelLimit?: number;
+    neededChunks: number;
     done: boolean;
-    slice: number;
-    sliceMs: number;
+    tick?: LodTickStats;
+    tickMs?: number;
   };
-  const { instanceIndices, chunks, pixelLimit, done, slice, sliceMs } = result;
+  const { instanceIndices, chunks, pixelLimit, neededChunks, done, tick } =
+    result;
 
-  const indices = keyInstances.reduce(
-    (indices, [key, _instance], index) => {
-      indices[key] = instanceIndices[index];
-      return indices;
-    },
-    {} as Record<
-      string,
-      { lodId: number; numSplats: number; indices: Uint32Array }
-    >,
-  );
-  // console.log(`traverseLodTrees: instanceIndices=${instanceIndices.length}`);
+  const keyIndices =
+    instanceIndices === null
+      ? null
+      : keyInstances.reduce(
+          (indices, [key, _instance], index) => {
+            indices[key] = instanceIndices[index];
+            return indices;
+          },
+          {} as Record<
+            string,
+            { lodId: number; numSplats: number; indices: Uint32Array }
+          >,
+        );
+  // console.log(`traverseLodTrees: instanceIndices=${instanceIndices?.length}`);
   // console.log(`traverseLodTrees: chunks=${chunks.length}`, JSON.stringify(chunks));
   return {
-    keyIndices: indices,
+    keyIndices,
     chunks,
     pixelLimit,
+    neededChunks,
     done,
-    slice,
-    sliceMs,
+    tick,
   };
 }
 
