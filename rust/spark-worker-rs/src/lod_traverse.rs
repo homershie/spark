@@ -244,12 +244,15 @@ pub(crate) fn limit_key(pixel_scale_limit: f32) -> f32 {
 
 /// 與 v2.1.0 的 `compute_pixel_scale` 同式,只是參數改吃 `InstanceParams`。
 pub(crate) fn compute_pixel_scale(splat: &LodSplat, p: &InstanceParams) -> f32 {
-    let center = splat.center();
+    compute_pixel_scale_raw(splat.center(), splat.size(), p)
+}
+
+/// 同上,吃已解出的 center/size(IncrementalCut 的 arena 存 f16 副本,不經過 LodSplat)。
+pub(crate) fn compute_pixel_scale_raw(center: Vec3A, size: f32, p: &InstanceParams) -> f32 {
     let delta = center - p.origin;
     let distance = delta.length().max(1.0e-6);
     let inv_distance = 1.0 / distance;
-    let pixel_scale = splat.size() * inv_distance * p.lod_scale;
-
+    let pixel_scale = size * inv_distance * p.lod_scale;
     let forward_dot = delta.dot(p.forward);
     let foveate = if forward_dot <= 0.0 {
         p.behind_foveate
@@ -269,7 +272,7 @@ pub(crate) fn compute_pixel_scale(splat: &LodSplat, p: &InstanceParams) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ahash::AHashMap;
     use glam::Vec3;
@@ -282,7 +285,7 @@ mod tests {
     /// 三層四叉樹,全部在 chunk 0(paged_index == index):
     /// root(0, size 8) → 1..=4(size 4) → 5..=20(size 2) → 21..=84 葉(size 1)。
     /// 回傳 (splats, parent) —— parent[root] = u32::MAX。
-    fn build_tree() -> (Vec<LodSplat>, Vec<u32>) {
+    pub(crate) fn build_tree() -> (Vec<LodSplat>, Vec<u32>) {
         let mut splats = vec![LodSplat::default(); 85];
         let mut parent = vec![u32::MAX; 85];
         splats[0] = LodSplat::new(Vec3::ZERO, 8.0, 1, 4);
@@ -303,7 +306,7 @@ mod tests {
 
     /// foveation 全 1(cone_dot0 = cone_dot = 1 → 任何角度都走最後一支、算出 1),
     /// 相機在 z = -50,節點在 z ≈ 0 → pixel_scale ≈ size / 50,層與層之間有明確大小差。
-    fn params() -> InstanceParams {
+    pub(crate) fn params() -> InstanceParams {
         InstanceParams {
             origin: Vec3A::new(0.0, 0.0, -50.0),
             forward: Vec3A::Z,

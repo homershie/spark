@@ -20,6 +20,12 @@ mod ext_splats;
 mod lod_splat;
 mod lod_tree;
 mod lod_traverse;
+// `IncrementalCut` 目前只被自己的 `#[cfg(test)]` 測試用到——`lod_tree.rs` 要到方案 B
+// 後續任務(tick 接上 traverse_lod_trees)才會消費它;在那之前 release/wasm build 沒有
+// `#[cfg(test)]`,這裡是真的死碼,故 allow 只在非 test build 生效(同 lod_splat.rs 的
+// `LodSplat::new` 那條先例)。
+#[cfg_attr(not(test), allow(dead_code))]
+mod lod_cut;
 #[cfg(test)]
 mod lod_synth;
 
