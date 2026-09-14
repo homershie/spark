@@ -594,12 +594,6 @@ impl IncrementalCut {
         let n = self.nodes.len();
         let mut checks = 0u32;
         let mut stopped = false;
-        // 這個 tick 的掃描是否被 `scan_deadline` 切斷(沒掃完一整輪)。只用來擋 0.9 衰減規則
-        // (見下面「4. 門檻控制器」)——不動 `stopped`:`stopped` 還是只代表「拆/收自己的 deadline
-        // 到了」,掃描配額用完不影響拆/收本輪能不能做(它們仍有自己的時間,同原本這裡的註解)。
-        // 沒有這面旗標,0.9 衰減會在「還沒掃完、根本不知道 expand_heap 是不是真的空」時就把 t 往下壓
-        // (production 被 0.98 那道 gate 蓋住沒露出來,但規則本身要對——見 misfit_pinned 欄位註解同一類問題)。
-        let mut scan_stopped = false;
         for _ in 0..n {
             // C1:deadline 檢查移到讀 / 前進 cursor 之前 —— 一旦這裡中斷,這個 slot 還沒被讀取,
             // cursor 也還沒往前、`visited_since_change` 也還沒 +1(不能算「訪問過」)。原本的順序
@@ -607,8 +601,7 @@ impl IncrementalCut {
             // 已訪問 ——兩個連續 tick 都卡在 deadline 上就會出現 `scanned=0` 卻 `settled=true`。
             checks += 1;
             if checks % self.deadline_stride == 0 && scan_deadline() {
-                scan_stopped = true;
-                break; // 掃描配額用完;拆收仍有自己的時間
+                break; // 掃描配額用完;拆收仍有自己的時間(不動 `stopped`,見下面「4. 門檻控制器」的說明)
             }
             if self.cursor >= n {
                 self.cursor = 0;
@@ -771,10 +764,17 @@ impl IncrementalCut {
         if st.collapsed > 0 {
             self.misfit_pinned = false;
         }
+        // `visited_since_change >= nodes.len()`:自上次讓集合失效的變動(params/max/limit/
+        // generation/t)以來已經完整掃過一整輪,`expand_heap` 空才真的代表「沒有候選」,不是
+        // 「還沒掃到」。production 一個 tick 常常掃不完一整輪(2.5M 的 cut 一輪要切成約 4 個
+        // tick),原本考慮用「這個 tick 有沒有被掃描 deadline 打斷」擋衰減——但那樣衰減永遠
+        // 等不到條件成立(每個 tick 幾乎都會被打斷)。改用這個跨 tick 累積的證據,不受單一
+        // tick 切多細影響,production 的 0.98 gate 之外多這層邏輯也才站得住腳。
         if let Some(ps) = misfit_ps {
             self.t = ps;
             self.misfit_pinned = true;
-        } else if !stopped && !scan_stopped && self.expand_heap.is_empty() && self.t > limit
+        } else if !stopped && self.visited_since_change >= self.nodes.len()
+            && self.expand_heap.is_empty() && self.t > limit
             && (self.cut_size as f32) < 0.98 * self.max_splats as f32
             && !self.misfit_pinned
         {
@@ -1289,17 +1289,32 @@ mod tests {
     fn inc_chunks_needed_covers_cut() {
         let (splats0, _) = build_tree();
         let mut splats = vec![LodSplat::default(); 3 * 65536];
+        // c2p = [0, 2, 1]:chunk-space chunk 1(L2 節點,原索引 5..=20)實際存頁 2、
+        // chunk-space chunk 2(葉,原索引 21..=84)實際存頁 1 —— 資料擺放位置要照映射走,
+        // 不能直接拿 chunk-space 當 storage index(那樣會變成頁 1↔頁 2 對調,chunk 2 永遠
+        // 沒人碰,樹退化成 2 層 16 leaves)。
         for (i, s) in splats0.iter().enumerate() {
-            let dst = if i >= 21 { 2 * 65536 + (i - 21) } else if i >= 5 { 65536 + (i - 5) } else { i };
+            let dst = if i >= 21 { 65536 + (i - 21) } else if i >= 5 { 2 * 65536 + (i - 5) } else { i };
             splats[dst] = s.clone();
         }
+        // child_start 維持 chunk-space(不受頁映射影響):1..=4 指向 chunk-space chunk1、
+        // 5..=20 指向 chunk-space chunk2;只有上面的 storage 位置(dst)照映射換過。
         for i in 1..=4usize { splats[i].child_start = 65536 + ((i - 1) * 4) as u32; }
-        for i in 5..=20usize { splats[65536 + (i - 5)].child_start = 2 * 65536 + ((i - 5) * 4) as u32; }
+        for i in 5..=20usize { splats[2 * 65536 + (i - 5)].child_start = 2 * 65536 + ((i - 5) * 4) as u32; }
         let c2p = [0u32, 2, 1];
-        for o in [Vec3A::new(0.0, 0.0, -50.0), Vec3A::new(0.0, 0.0, -150.0), Vec3A::new(0.0, 0.0, -100.0)] {
+        for (pose_idx, o) in [Vec3A::new(0.0, 0.0, -50.0), Vec3A::new(0.0, 0.0, -150.0), Vec3A::new(0.0, 0.0, -100.0)].into_iter().enumerate() {
             let trees = views_p(&splats, &c2p, pose(o));
             let mut cut = IncrementalCut::new();
             cut.restart(&trees, &[0], 0.03);
+            cut.deadline_stride = 1; // 讓共用 Cell 的 deadline 真的能在掃一半時中斷
+            // z=-50 這一站的四層樹(root/L1 在 chunk0、L2 在 chunk1、葉在 chunk2)展到底,
+            // 「settled 那一刻」單一深度的兄弟節點是同批跨過門檻的,cut 已經全部落在葉層
+            // (chunk2 一家獨大,chunk1 的 L2 節點都展開走了)——這是本測試存在的目的要驗的東西
+            // 其實不在「終態」,而在**展開途中**:L2 一顆顆展成葉的那段,cut 會同時橫跨
+            // chunk1(還沒展的 L2 節點)與 chunk2(已經展開的葉),這時候 `chunks().needed`
+            // 段要能同時覆蓋兩者才對得上不變式 2。用 `deadline_stride = 1` 把過程切成很多格
+            // 就是為了讓這段跨 chunk 的中間態被踩到、不被一個大 tick 直接跳過去。
+            let mut saw_chunks_1_and_2 = false;
             loop {
                 let n = std::cell::Cell::new(0u32);
                 let stop = || { n.set(n.get() + 1); n.get() > 2 };
@@ -1308,7 +1323,18 @@ mod tests {
                 let ch = cut.chunks();
                 let listed: AHashSet<u32> = ch.list[..ch.roots + ch.needed].iter().map(|&(_, c)| c).collect();
                 assert!(used.is_subset(&listed), "used {used:?} listed {listed:?}");
+                if used.contains(&1) && used.contains(&2) {
+                    saw_chunks_1_and_2 = true;
+                }
                 if st.settled { break; }
+            }
+            if pose_idx == 0 {
+                assert!(
+                    saw_chunks_1_and_2,
+                    "z=-50 展到葉層的過程應該經過『cut 同時橫跨 chunk1(L2)與 chunk2(葉)』的中間態,\
+                     這正是本測試要證的 needed ⊇ used 在多 chunk 下成立;沒踩到代表 deadline_stride \
+                     沒把過程切細,或展開順序變了"
+                );
             }
         }
     }
@@ -1338,7 +1364,7 @@ mod tests {
         let trees1 = vec![TreeView { lod_id: 9, splats: &splats, chunk_to_page: &c2p, params: p }];
         let st = cut.tick(&trees1, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false);
         assert_eq!(cut.roots.len(), 1);
-        assert!(st.cut_size <= 64);
+        assert_eq!(st.cut_size, 64);
         settle(&mut cut, &trees1, 1000, 0.03, 0.0);
         assert_eq!(cut_indices(&cut), (21..=84).collect::<Vec<_>>());
     }
