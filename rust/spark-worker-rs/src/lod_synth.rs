@@ -246,8 +246,13 @@ pub(crate) fn bench_main(rounds: usize) {
 /// (`COLD START: N ticks`),**不**計進 `settle ticks` 的 median/max、也**不**計進
 /// `all_tick`/`all_pack`(這兩份統計代表「走路中途轉頭一次」的穩態成本,冷啟動混進去會把
 /// p90 拉到失真)。
+///
+/// `eps` = 遲滯帶(`cut.tick` 的 hysteresis 參數,production/預設 0.15);`diag` 開啟時
+/// 每站結束多印一行 `t`/`cut_size`/該站姿態下的原子 cut 大小,用來判斷 Jaccard 沒達標
+/// 是遲滯帶本身的結構性差距,還是 `t` 卡在真正均衡點之上(Task 5 review round 2 的診斷,
+/// 見 `docs/superpowers/specs/2026-09-11-incremental-traverse-design.md` §7.2)。
 #[allow(dead_code)]
-pub(crate) fn walk_main(rounds: usize) {
+pub(crate) fn walk_main(rounds: usize, eps: f32, diag: bool) {
     use crate::lod_cut::IncrementalCut;
     use std::time::Instant;
     const COLD_START_TICK_CAP: u32 = 400;
@@ -266,6 +271,7 @@ pub(crate) fn walk_main(rounds: usize) {
     // 最後一站實際用來 tick 的姿態(推進之前存起來,見 task brief 的提醒:
     // 推進之後的 origin/yaw 不是最後一站 tick 時用的那個,Jaccard 會量錯東西)。
     let mut last = (origin, yaw);
+    eprintln!("WALK PARAMS: eps={eps} diag={diag}");
     for station in 0..(20 * rounds) {
         let cold_start = station == 0;
         let tick_cap = if cold_start { COLD_START_TICK_CAP } else { NORMAL_TICK_CAP };
@@ -276,7 +282,7 @@ pub(crate) fn walk_main(rounds: usize) {
             let t = Instant::now();
             let scan_at = t + std::time::Duration::from_millis(12);
             let deadline_at = t + std::time::Duration::from_millis(20);
-            let st = cut.tick(&trees, &[root_page], max, limit, 0.15, &mut || Instant::now() >= scan_at, &mut || Instant::now() >= deadline_at);
+            let st = cut.tick(&trees, &[root_page], max, limit, eps, &mut || Instant::now() >= scan_at, &mut || Instant::now() >= deadline_at);
             let tick_ms = t.elapsed().as_secs_f64() * 1e3;
             let t2 = Instant::now();
             let packed = if cut.needs_pack() { Some(cut.pack(&trees)) } else { None };
@@ -300,6 +306,13 @@ pub(crate) fn walk_main(rounds: usize) {
                 med(&mut cold_start_tick.clone()));
         } else {
             settle_ticks.push(ticks);
+        }
+        if diag {
+            // 該站姿態下的原子 cut 大小(不看去重/遲滯,純粹「這個預算 + 這個門檻能撐到的最終
+            // 節點數」)—— 跟 `cut.t`/`cut.cut_size` 對照,能看出 `t` 有沒有卡在真正均衡點之上
+            // (decay gate `cut < 0.98·max` 在 cut 落在 [0.98·max, max] 之間會擋住衰減)。
+            let (_, atomic_n) = run_atomic(&splats, &c2p, root_page, trees[0].params, max);
+            eprintln!("station {station} DIAG: t={:.6} cut_size={} atomic_cut={atomic_n}", cut.t, cut.cut_size);
         }
         last = (origin, yaw);
         origin += Vec3A::new(0.05 * yaw.cos(), 0.0, -0.05 * yaw.sin());
