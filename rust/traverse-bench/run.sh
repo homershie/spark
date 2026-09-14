@@ -9,7 +9,7 @@
 # wasm 用與 build_rust_wasm.sh 相同的 target-feature(simd128 + bulk-memory),數字才跟瀏覽器裡的
 # worker 同一種碼;Node 的 V8 與瀏覽器同一顆引擎。
 # `set -e` 不含 run 那兩行(見下方 `|| status=$?`):walk 模式的 `walk_main` 尾端在
-# `eps == 0.0` 時才 `assert!(jaccard >= 0.97)`(Task 5 review round 2 裁決:遲滯帶內的
+# `eps == 0.0` 時才 `assert!(jaccard >= 0.93)`(Task 5 review round 2 裁決:遲滯帶內的
 # 節點依定義不動,這道 assert 只在零遲滯下才是「跟原子等價」的判準;`eps > 0` 只印
 # informational 訊息)、不論 eps 為何都 `assert!(cut_size >= 0.95·max)`——皆是刻意留著的
 # 可證偽品質閘門(非印出來的軟警示)。native 那支 assert 失敗不該讓 wasm 那支永遠跑不到,

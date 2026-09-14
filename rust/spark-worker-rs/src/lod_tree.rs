@@ -159,6 +159,10 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
         // 借用的 `lod_tree`)結束之後才餵給 `state.cut`——`note_chunk_released` 需要 `&mut state.cut`,
         // 跟迴圈裡借著的 `state.lod_trees` 分開處理,不用在借用還活著時硬擠進同一行。
         let mut released: Vec<(u32, u32)> = Vec::new();
+        // 對稱地收集頁「補回」的 (lod_id, chunk)(`lod_tree_data` 為真的分支,每頁寫入資料
+        // 就算一次到達)——`note_chunk_resident` 同樣需要 `&mut state.cut`,理由同上(review
+        // 最終輪 F1 + F2)。
+        let mut resident: Vec<(u32, u32)> = Vec::new();
 
         for (&lod_id, &page_base, &chunk_base, &count, lod_tree_data) in izip!(lod_ids, page_bases, chunk_bases, counts, lod_trees.iter()) {
             let lod_tree = state.lod_trees.get_mut(&lod_id).unwrap();
@@ -183,6 +187,7 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
                 for page in 0..pages {
                     lod_tree.page_to_chunk[(base_page + page) as usize] = base_chunk + page;
                     lod_tree.chunk_to_page[(base_chunk + page) as usize] = base_page + page;
+                    resident.push((lod_id, base_chunk + page));
                 }
 
                 let lod_tree_data = Uint32Array::from(lod_tree_data);
@@ -195,6 +200,11 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
         // 渲染指向舊 chunk 的 paged index,而那個槽位現在住著別的資料。
         for (lod_id, chunk) in released {
             state.cut.note_chunk_released(lod_id, chunk);
+        }
+        // review 最終輪 F1 + F2:對稱地通知頁「補回」——cut 原本只從頁釋放得知變化,從沒被告知
+        // 頁到達,見 `IncrementalCut::note_chunk_resident` 的文件註解。
+        for (lod_id, chunk) in resident {
+            state.cut.note_chunk_resident(lod_id, chunk);
         }
 
         let result = Object::new();

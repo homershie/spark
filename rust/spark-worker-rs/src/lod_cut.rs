@@ -545,7 +545,36 @@ impl IncrementalCut {
         }
     }
 
+    /// pager 補回了 `lod_id` 的 `chunk`(`update_lod_trees` 的頁補回分支呼叫,與
+    /// `note_chunk_released` 對稱)。修的是「cut 只從頁釋放得知變化,從沒被告知頁到達」這個缺口
+    /// (review 最終輪 F1 + F2):兩件事各自獨立判斷,互不相依。
+    ///
+    /// F1:若這個 chunk 正被 `wanted` 記著(有節點的孩子在等它),代表掃描 / 拆收可能已經錯過
+    /// 它——`settled()` 可能已經是 true(見該函式文件:`wanted` 非空不阻止 settled),JS 因此
+    /// 停止 tick,剛抓回來的頁就浪費了。把 `visited_since_change` 歸零,逼 `settled()` 立刻變
+    /// false、強迫下一輪完整重掃一遍,重新把候選推進 heap。
+    ///
+    /// F2:若這個 chunk 目前被 cut 引用(`chunk_refs` > 0),代表它是先前被 evicted 的洞
+    /// (`note_chunk_released` 標過的那種)現在補回來了——不論這個洞後來有沒有靠強制收回
+    /// 自癒(collapse() 可能因為 parent 自己的 chunk 也不 resident 而失敗,洞會一直卡著,見
+    /// `inc_page_return_heals_hole`),標 `tables_dirty` 讓 `needs_pack()` 抓到:下次 `pack()`
+    /// 重新掃描孩子的殘留狀態,發現它 resident 了,洞自己補上,不需要真的發生 collapse。
+    pub(crate) fn note_chunk_resident(&mut self, lod_id: u32, chunk: u32) {
+        let Some(inst) = self.lod_ids.iter().position(|&id| id == lod_id) else {
+            return;
+        };
+        let inst = inst as u8;
+        if self.wanted.contains_key(&(inst, chunk)) {
+            self.visited_since_change = 0;
+        }
+        if self.chunk_refs[inst as usize].get(&chunk).copied().unwrap_or(0) > 0 {
+            self.tables_dirty = true;
+        }
+    }
+
     /// fetchPriority:每 instance 的 root chunk、needed(refcount > 0,chunk 遞增)、wanted(ps 遞減)。
+    /// `wanted` 本身已經在 `tick()` 的 pass 折返時清過期項(見那裡的說明),這裡不再需要重複
+    /// 過濾「兩個 pass 沒再要」——表本身就是乾淨的。
     pub(crate) fn chunks(&self) -> Chunks {
         let mut list = Vec::new();
         for &id in &self.lod_ids {
@@ -562,9 +591,7 @@ impl IncrementalCut {
             }
         }
         let needed = list.len() - roots;
-        // 兩個 pass 沒再要的不列(相機走開了)
-        let fresh = self.passes.saturating_sub(1);
-        let mut w: Vec<_> = self.wanted.iter().filter(|(_, v)| v.1 >= fresh).collect();
+        let mut w: Vec<_> = self.wanted.iter().collect();
         w.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(b.0)));
         for (&(inst, chunk), _) in w {
             let id = self.lod_ids[inst as usize];
@@ -677,6 +704,13 @@ impl IncrementalCut {
             if self.cursor >= n {
                 self.cursor = 0;
                 self.passes += 1;
+                // F3:pass 折返時順手清掉「兩個 pass 沒再要」的 wanted 項——不清的話 `wanted`
+                // 只在 `chunks()` 查詢時被過濾顯示,map 本身永遠不縮小,`TickStats::wanted_count`
+                // (= `wanted.len()`)因此摸不到文件承諾的健康值(串流完成後回到 0)。語意跟
+                // 過去 `chunks()` 內建的過濾器完全相同(`v.1 >= passes.saturating_sub(1)`
+                // ⟺ `v.1 + 1 >= passes`),只是把清理挪到源頭,不用每次查詢都重算。
+                let p = self.passes;
+                self.wanted.retain(|_, v| v.1 + 1 >= p);
             }
             let slot = self.cursor as u32;
             self.cursor += 1;
@@ -1590,6 +1624,145 @@ mod tests {
         settle(&mut cut, &far, 1000, 0.03, 0.0);            // 拉遠:節點 20 收回,沒人再要 chunk 1
         for _ in 0..3 { cut.tick(&far, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false); }
         assert!(!cut.chunks().list.contains(&(LOD_ID, 1)));
+    }
+
+    /// F1 回歸測試(review 最終輪):頁到達後,若沒人通知 `cut`,`settled()` 可能在「還有節點在等
+    /// 這個 chunk」時就已經是 true(見 `settled()` 的說明——`wanted` 非空不阻止 settled)。JS 只在
+    /// `lodTreeDirty` 那一 tick 給一次掃描機會,若那次掃描沒踩到剛好在等這個 chunk 的節點(例如
+    /// deadline 太緊),`settled()` 仍然真,JS 從此不再 tick,已經抓回來的頁就浪費了。
+    /// `note_chunk_resident` 補這個缺口:只要 `wanted` 裡有人在等這個 chunk,就把
+    /// `visited_since_change` 歸零,強迫 `settled()` 立刻變 false、逼出下一輪完整掃描。
+    #[test]
+    fn inc_page_arrival_unsettles_and_expands() {
+        let (mut splats, _) = build_tree();
+        splats[20] = LodSplat::new(glam::Vec3::new(20.0, 1.0, 0.0), 2.0, 65536, 4);
+        let mut splats2 = splats.clone();
+        splats2.resize(2 * 65536, LodSplat::default());
+        for k in 0..4usize {
+            splats2[65536 + k] = LodSplat::new(glam::Vec3::new(8.0 + k as f32 * 0.1, 2.0, 0.0), 1.0, 0, 0);
+        }
+        let p = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let c2p = [0u32, NOT_RESIDENT];
+        let trees = views_p(&splats2, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        assert!(cut_indices(&cut).contains(&20));
+        assert_eq!(cut.cut_size, 61);
+        assert!(cut.wanted.contains_key(&(0, 1)));
+        assert!(cut.settled(), "settle() 剛跑完應該已經 settled");
+
+        // 頁到了:chunk 1 → page 1
+        let c2p2 = [0u32, 1];
+        let trees2 = views_p(&splats2, &c2p2, p);
+        cut.note_chunk_resident(LOD_ID, 1);
+        assert!(!cut.settled(), "wanted 裡有人在等這個 chunk,resident 了應該解掉 settled");
+
+        // 之後每個 tick 的掃描配額極緊(1 個 slot 就喊停),模擬「第一個 tick 搆不到節點 20 所在
+        // 深度」的情境;拆收(deadline)不受限,讓拆展開能在掃到候選的同一個 tick 內完成。
+        cut.deadline_stride = 1;
+        let mut ticks = 0;
+        loop {
+            let n = std::cell::Cell::new(0u32);
+            let mut scan_stop = || { n.set(n.get() + 1); n.get() > 1 };
+            let st = cut.tick(&trees2, &[0], 1000, 0.03, 0.0, &mut scan_stop, &mut || false);
+            ticks += 1;
+            if st.settled {
+                break;
+            }
+            assert!(ticks < 2000, "不收斂");
+        }
+        assert_eq!(cut.cut_size, 64);
+        assert!(cut.wanted.is_empty());
+    }
+
+    /// F2 回歸測試(review 最終輪):被 evicted 的葉子若因為「parent 自己的 chunk 也不 resident」
+    /// 導致強制收回(見 `inc_evicted_leaf_forces_collapse`)這條自癒路徑失效,洞會卡住——
+    /// `generation` 沒變(沒有真的 collapse 發生)、`tables_dirty` 也沒有任何東西設它(頁補回沒人
+    /// 通知 `cut`,這正是 F2 的根因)。驗證 `note_chunk_resident` 補上這個缺口。
+    ///
+    /// 樹形沿用 `build_tree()`,但把「節點 5」連同它的 4 個孩子(原 21..24)分別搬到獨立的
+    /// chunk-space chunk 2 / chunk 1,讓兩者可以各自獨立踢除——這是跟
+    /// `inc_evicted_leaf_forces_collapse` 的關鍵差異:那邊只踢孩子的 chunk1,節點 5 自己仍留在
+    /// chunk0(跟 root/L1/其他 L2 共用,恆 resident),所以 `collapse()` 檢查「自己的 chunk
+    /// resident 嗎」永遠過關,強制收回一定成功。這裡兩個 chunk 都踢,`collapse()` 的
+    /// `!Self::resident(tree, node.index >> 16)` 守衛擋下收回,洞卡住。
+    #[test]
+    fn inc_page_return_heals_hole() {
+        let (splats0, _) = build_tree();
+        let mut splats = vec![LodSplat::default(); 3 * 65536];
+        for (i, s) in splats0.iter().enumerate() {
+            let dst = if i == 5 {
+                2 * 65536 // 節點 5 本身搬到 chunk2
+            } else if (21..=24).contains(&i) {
+                65536 + (i - 21) // 節點 5 的孩子(原葉 21..24)搬到 chunk1
+            } else if (6..=8).contains(&i) {
+                2 * 65536 + (i - 5) // 節點 5 的手足(6,7,8)跟著搬到 chunk2,維持 node1 child_start 連續
+            } else {
+                i // root / L1 / 其他 L2 / 其他葉一律留在 chunk0,原封不動
+            };
+            splats[dst] = s.clone();
+        }
+        // node1(index 1)的 child_start 原本 5(指向舊編號的節點 5..8),改指到 chunk2 的新位置
+        splats[1].child_start = 2 * 65536;
+        // 節點 5(現在存放於 2*65536)的 child_start 原本 21(指向舊編號的葉 21..24),改指到 chunk1
+        splats[2 * 65536].child_start = 65536;
+
+        let p = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let c2p = [0u32, 1, 2];
+        let trees = views_p(&splats, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        assert_eq!(cut.cut_size, 64);
+
+        // 孩子(chunk1)與節點 5 自己(chunk2)同時踢除
+        let c2p_evicted = [0u32, NOT_RESIDENT, NOT_RESIDENT];
+        let trees_e = views_p(&splats, &c2p_evicted, p);
+        let packed = cut.pack(&trees_e);
+        assert_eq!(packed.evicted, 4, "節點 5 的 4 個孩子不 resident");
+
+        let st = cut.tick(&trees_e, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false);
+        assert_eq!(st.collapsed, 0, "節點 5 自己的 chunk(2)也不 resident,強制收回應該失敗");
+
+        // 洞持續存在:forced tick 之後重 pack 仍然是同一個洞
+        let packed2 = cut.pack(&trees_e);
+        assert!(packed2.evicted > 0, "強制收回失敗,洞應該還在");
+        assert!(!cut.needs_pack(), "pack() 剛跑完應該不髒(needs_pack 只反映『該不該重 pack』,不是『有沒有洞』)");
+
+        // 頁補回(c2p 兩個 chunk 都恢復)
+        let c2p_restored = [0u32, 1, 2];
+        let trees_r = views_p(&splats, &c2p_restored, p);
+        assert!(!cut.needs_pack(), "note_chunk_resident 之前不該髒");
+        cut.note_chunk_resident(LOD_ID, 1);
+        assert!(cut.needs_pack(), "cut 引用的 chunk(節點 5 的孩子所在)resident 了,應該標髒");
+
+        let packed3 = cut.pack(&trees_r);
+        assert_eq!(packed3.evicted, 0, "洞應該自己補好,不需要真的收回");
+        assert_eq!(packed3.indices[0].len(), 64);
+    }
+
+    /// F3 回歸測試(review 最終輪):`wanted` 只在 `chunks()` 查詢時用「兩個 pass 沒再要」過濾
+    /// 顯示,map 本身從不清理——`TickStats::wanted_count = wanted.len()` 因此永遠讀到含過期項的
+    /// 原始大小,「wantedCount 回到 0」這個健康值文件承諾了但摸不到。修完之後在 pass 折返時順手
+    /// 清掉過期項,`chunks()` 的顯示過濾器也跟著拿掉(不再需要,表本身已經是乾淨的)。
+    #[test]
+    fn inc_wanted_count_returns_to_zero() {
+        let (mut splats, _) = build_tree();
+        splats[20] = LodSplat::new(glam::Vec3::new(20.0, 1.0, 0.0), 2.0, 65536, 4);
+        let c2p = [0u32, NOT_RESIDENT];
+        let near = views_p(&splats, &c2p, pose(Vec3A::new(0.0, 0.0, -50.0)));
+        let far = views_p(&splats, &c2p, pose(Vec3A::new(0.0, 0.0, -150.0)));
+        let mut cut = IncrementalCut::new();
+        cut.restart(&near, &[0], 0.03);
+        settle(&mut cut, &near, 1000, 0.03, 0.0);
+        assert!(cut.wanted.contains_key(&(0, 1)));
+        settle(&mut cut, &far, 1000, 0.03, 0.0); // 拉遠:節點 20 收回,沒人再要 chunk 1
+        let mut st = TickStats::default();
+        for _ in 0..3 {
+            st = cut.tick(&far, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false);
+        }
+        assert_eq!(st.wanted_count, 0, "兩個 pass 沒再要,wanted 這張表本身應該清空,不是只在 chunks() 的顯示過濾器背後卡著 1 筆");
     }
 
     /// 拆收 1000 次後 arena 不增長(≤ 32 分桶 free list 重用)。
