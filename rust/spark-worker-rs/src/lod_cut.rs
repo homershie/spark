@@ -145,6 +145,9 @@ pub(crate) struct IncrementalCut {
     /// 騰出預算(或 params/max/limit 變動)才清掉。沒有它,misfit 剛把 t 頂上去、下一輪衰減規則馬上
     /// 又把它壓下來、同一個候選立刻又 misfit——t 永遠在兩個值之間跳,`visited_since_change` 每 tick
     /// 都被 C2 的「t 變了就歸零」重置,`settled()` 永遠不會真。
+    /// 在 production 的預算量級下(child_count ≪ 0.02·max_splats)0.98·max 那道 gate 早就先擋掉
+    /// misfit 之後的衰減,這面旗標其實摸不到；真正用得上它的是小樹 / 測試(child_count 相對
+    /// max_splats 不是可忽略的量級,0.98 gate 擋不住)。
     misfit_pinned: bool,
 }
 
@@ -591,6 +594,12 @@ impl IncrementalCut {
         let n = self.nodes.len();
         let mut checks = 0u32;
         let mut stopped = false;
+        // 這個 tick 的掃描是否被 `scan_deadline` 切斷(沒掃完一整輪)。只用來擋 0.9 衰減規則
+        // (見下面「4. 門檻控制器」)——不動 `stopped`:`stopped` 還是只代表「拆/收自己的 deadline
+        // 到了」,掃描配額用完不影響拆/收本輪能不能做(它們仍有自己的時間,同原本這裡的註解)。
+        // 沒有這面旗標,0.9 衰減會在「還沒掃完、根本不知道 expand_heap 是不是真的空」時就把 t 往下壓
+        // (production 被 0.98 那道 gate 蓋住沒露出來,但規則本身要對——見 misfit_pinned 欄位註解同一類問題)。
+        let mut scan_stopped = false;
         for _ in 0..n {
             // C1:deadline 檢查移到讀 / 前進 cursor 之前 —— 一旦這裡中斷,這個 slot 還沒被讀取,
             // cursor 也還沒往前、`visited_since_change` 也還沒 +1(不能算「訪問過」)。原本的順序
@@ -598,6 +607,7 @@ impl IncrementalCut {
             // 已訪問 ——兩個連續 tick 都卡在 deadline 上就會出現 `scanned=0` 卻 `settled=true`。
             checks += 1;
             if checks % self.deadline_stride == 0 && scan_deadline() {
+                scan_stopped = true;
                 break; // 掃描配額用完;拆收仍有自己的時間
             }
             if self.cursor >= n {
@@ -764,7 +774,7 @@ impl IncrementalCut {
         if let Some(ps) = misfit_ps {
             self.t = ps;
             self.misfit_pinned = true;
-        } else if !stopped && self.expand_heap.is_empty() && self.t > limit
+        } else if !stopped && !scan_stopped && self.expand_heap.is_empty() && self.t > limit
             && (self.cut_size as f32) < 0.98 * self.max_splats as f32
             && !self.misfit_pinned
         {
@@ -1180,5 +1190,196 @@ mod tests {
         assert_eq!(cut_indices(&cut), atomic_cut(&splats, &pose_b, limit, max));
         assert!(cut.cut_size <= max);
         assert_valid(&cut, &parent);
+    }
+
+    /// 孩子 chunk 不 resident:不拆、chunks 尾段含它;chunk_to_page 補上後下一 pass 拆開。
+    #[test]
+    fn inc_nonresident_children_wanted_then_expanded() {
+        let (mut splats, _) = build_tree();
+        splats[20] = LodSplat::new(glam::Vec3::new(20.0, 1.0, 0.0), 2.0, 65536, 4);
+        let mut splats2 = splats.clone();
+        splats2.resize(2 * 65536, LodSplat::default());
+        for k in 0..4usize {
+            splats2[65536 + k] = LodSplat::new(glam::Vec3::new(8.0 + k as f32 * 0.1, 2.0, 0.0), 1.0, 0, 0);
+        }
+        let p = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let c2p = [0u32, NOT_RESIDENT];
+        let trees = views_p(&splats2, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        assert!(cut_indices(&cut).contains(&20));
+        assert_eq!(cut.cut_size, 61);
+        let chunks = cut.chunks();
+        assert_eq!(chunks.list.last(), Some(&(LOD_ID, 1)));
+        assert_eq!(chunks.needed, 0, "cut 全在 chunk 0 = root chunk,不重複列");
+        // 頁到了:chunk 1 → page 1
+        let c2p2 = [0u32, 1];
+        let trees2 = views_p(&splats2, &c2p2, p);
+        settle(&mut cut, &trees2, 1000, 0.03, 0.0);
+        assert!(!cut_indices(&cut).contains(&20));
+        assert_eq!(cut.cut_size, 64);
+        assert!(cut.wanted.is_empty());
+        assert!(cut.chunks().list.contains(&(LOD_ID, 1)));
+    }
+
+    /// 拉遠但 parent(節點 2)自己的 chunk 不 resident:不收、孩子仍在 cut、wanted 含 parent 的 chunk。
+    #[test]
+    fn inc_nonresident_parent_keeps_children() {
+        let (splats0, parent) = build_tree();
+        // 把節點 1..=4 搬到 chunk 1(index 65536+1..),其餘留 chunk 0;root 的 child_start 改指過去
+        let mut splats = vec![LodSplat::default(); 2 * 65536];
+        for (i, s) in splats0.iter().enumerate() {
+            if (1..=4).contains(&i) { splats[65536 + i] = s.clone(); } else { splats[i] = s.clone(); }
+        }
+        splats[0] = LodSplat::new(glam::Vec3::ZERO, 8.0, 65537, 4);
+        let _ = parent;
+        let near = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let far = pose(Vec3A::new(0.0, 0.0, -150.0));
+        let c2p = [0u32, 1];
+        let trees = views_p(&splats, &c2p, near);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        assert_eq!(cut.cut_size, 64);
+        // chunk 1 被踢,parent 1..=4 不 resident;拉遠要收到 L1 但收不了 → 停在 L2
+        let c2p_evicted = [0u32, NOT_RESIDENT];
+        let trees_far = views_p(&splats, &c2p_evicted, far);
+        for _ in 0..10 { cut.tick(&trees_far, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false); }
+        assert_eq!(cut_indices(&cut), (5..=20).collect::<Vec<_>>());
+        assert!(cut.wanted.contains_key(&(0, 1)));
+        assert!(cut.chunks().list.contains(&(LOD_ID, 1)), "parent 的 chunk 要進 fetchPriority");
+        // 頁回來 → 收到 L1
+        let trees_back = views_p(&splats, &c2p, far);
+        settle(&mut cut, &trees_back, 1000, 0.03, 0.0);
+        assert_eq!(cut_indices(&cut), vec![65537, 65538, 65539, 65540]);
+        assert!(!cut.wanted.contains_key(&(0, 1)));
+    }
+
+    /// pack 時孩子頁 NOT_RESIDENT:不輸出、evicted 計數、下一 tick 整組收回 parent。
+    #[test]
+    fn inc_evicted_leaf_forces_collapse() {
+        let (splats0, _) = build_tree();
+        let mut splats = vec![LodSplat::default(); 2 * 65536];
+        for (i, s) in splats0.iter().enumerate() {
+            if (21..=24).contains(&i) { splats[65536 + (i - 21)] = s.clone(); } else { splats[i] = s.clone(); }
+        }
+        splats[5] = LodSplat::new(glam::Vec3::new(5.0, 1.0, 0.0), 2.0, 65536, 4);
+        let p = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let c2p = [0u32, 1];
+        let trees = views_p(&splats, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        assert_eq!(cut.cut_size, 64);
+        let c2p_evicted = [0u32, NOT_RESIDENT];
+        let trees_e = views_p(&splats, &c2p_evicted, p);
+        let packed = cut.pack(&trees_e);
+        assert_eq!(packed.evicted, 4);
+        assert_eq!(packed.indices[0].len(), 60);
+        let st = cut.tick(&trees_e, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false);
+        assert!(st.collapsed >= 1);
+        assert!(cut_indices(&cut).contains(&5));
+        assert_eq!(cut.cut_size, 61);
+        assert_eq!(cut.pack(&trees_e).evicted, 0);
+    }
+
+    /// 任意時刻 chunks 的 needed 段 ⊇ cut 引用的 chunk 集合(不變式 2)。
+    #[test]
+    fn inc_chunks_needed_covers_cut() {
+        let (splats0, _) = build_tree();
+        let mut splats = vec![LodSplat::default(); 3 * 65536];
+        for (i, s) in splats0.iter().enumerate() {
+            let dst = if i >= 21 { 2 * 65536 + (i - 21) } else if i >= 5 { 65536 + (i - 5) } else { i };
+            splats[dst] = s.clone();
+        }
+        for i in 1..=4usize { splats[i].child_start = 65536 + ((i - 1) * 4) as u32; }
+        for i in 5..=20usize { splats[65536 + (i - 5)].child_start = 2 * 65536 + ((i - 5) * 4) as u32; }
+        let c2p = [0u32, 2, 1];
+        for o in [Vec3A::new(0.0, 0.0, -50.0), Vec3A::new(0.0, 0.0, -150.0), Vec3A::new(0.0, 0.0, -100.0)] {
+            let trees = views_p(&splats, &c2p, pose(o));
+            let mut cut = IncrementalCut::new();
+            cut.restart(&trees, &[0], 0.03);
+            loop {
+                let n = std::cell::Cell::new(0u32);
+                let stop = || { n.set(n.get() + 1); n.get() > 2 };
+                let st = cut.tick(&trees, &[0], 1000, 0.03, 0.0, &mut || stop(), &mut || stop());
+                let used: AHashSet<u32> = cut.cut_set_for_test().into_iter().map(|(_, i)| i >> 16).collect();
+                let ch = cut.chunks();
+                let listed: AHashSet<u32> = ch.list[..ch.roots + ch.needed].iter().map(|&(_, c)| c).collect();
+                assert!(used.is_subset(&listed), "used {used:?} listed {listed:?}");
+                if st.settled { break; }
+            }
+        }
+    }
+
+    #[test]
+    fn inc_restart_on_instance_change_and_multi_instance() {
+        let (splats, parent) = build_tree();
+        let c2p = [0u32];
+        let p = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let trees = vec![
+            TreeView { lod_id: 7, splats: &splats, chunk_to_page: &c2p, params: p },
+            TreeView { lod_id: 9, splats: &splats, chunk_to_page: &c2p, params: pose(Vec3A::new(0.0, 0.0, -150.0)) },
+        ];
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0, 0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        let set = cut.cut_set_for_test();
+        let a: Vec<u32> = { let mut v: Vec<u32> = set.iter().filter(|(i, _)| *i == 0).map(|(_, x)| *x).collect(); v.sort_unstable(); v };
+        let b: Vec<u32> = { let mut v: Vec<u32> = set.iter().filter(|(i, _)| *i == 1).map(|(_, x)| *x).collect(); v.sort_unstable(); v };
+        assert_eq!(a, (21..=84).collect::<Vec<_>>());
+        assert_eq!(b, vec![1, 2, 3, 4]);
+        assert_eq!(cut.cut_size, 68);
+        let ch = cut.chunks();
+        assert_eq!(&ch.list[..2], &[(7, 0), (9, 0)]);
+        let _ = parent;
+        // instance 集合變了 → restart
+        let trees1 = vec![TreeView { lod_id: 9, splats: &splats, chunk_to_page: &c2p, params: p }];
+        let st = cut.tick(&trees1, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false);
+        assert_eq!(cut.roots.len(), 1);
+        assert!(st.cut_size <= 64);
+        settle(&mut cut, &trees1, 1000, 0.03, 0.0);
+        assert_eq!(cut_indices(&cut), (21..=84).collect::<Vec<_>>());
+    }
+
+    /// 兩個 pass 沒再要的 wanted 不再列進 chunks(相機走開了)。
+    #[test]
+    fn inc_wanted_expires_after_two_passes() {
+        let (mut splats, _) = build_tree();
+        splats[20] = LodSplat::new(glam::Vec3::new(20.0, 1.0, 0.0), 2.0, 65536, 4);
+        let c2p = [0u32, NOT_RESIDENT];
+        let near = views_p(&splats, &c2p, pose(Vec3A::new(0.0, 0.0, -50.0)));
+        let far = views_p(&splats, &c2p, pose(Vec3A::new(0.0, 0.0, -150.0)));
+        let mut cut = IncrementalCut::new();
+        cut.restart(&near, &[0], 0.03);
+        settle(&mut cut, &near, 1000, 0.03, 0.0);
+        assert!(cut.chunks().list.contains(&(LOD_ID, 1)));
+        settle(&mut cut, &far, 1000, 0.03, 0.0);            // 拉遠:節點 20 收回,沒人再要 chunk 1
+        for _ in 0..3 { cut.tick(&far, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false); }
+        assert!(!cut.chunks().list.contains(&(LOD_ID, 1)));
+    }
+
+    /// 拆收 1000 次後 arena 不增長(≤ 32 分桶 free list 重用)。
+    #[test]
+    fn inc_arena_freelist_reuse() {
+        let (splats, _) = build_tree();
+        let c2p = [0u32];
+        let near = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let far = pose(Vec3A::new(0.0, 0.0, -150.0));
+        let tn = views_p(&splats, &c2p, near);
+        let tf = views_p(&splats, &c2p, far);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&tn, &[0], 0.03);
+        settle(&mut cut, &tn, 1000, 0.03, 0.0);
+        let arena_len = cut.arena.len();
+        let nodes_len = cut.nodes.len();
+        for _ in 0..1000 {
+            settle(&mut cut, &tf, 1000, 0.03, 0.0);
+            settle(&mut cut, &tn, 1000, 0.03, 0.0);
+        }
+        assert_eq!(cut.arena.len(), arena_len);
+        assert_eq!(cut.nodes.len(), nodes_len);
+        assert_eq!(cut.arena_leaked, 0);
     }
 }
