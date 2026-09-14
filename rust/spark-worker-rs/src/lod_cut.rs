@@ -91,7 +91,8 @@ pub(crate) struct TickStats {
     pub(crate) collapsed: u32,
     pub(crate) passes: u32,
     pub(crate) settled: bool,
-    /// `tick()` 本身不 pack,不填這個欄位(Task 4 接 `pack()` 之後才會有值)。
+    /// `tick()` 本身不 pack,不填這個欄位——真值是 `pack()` 回傳的 `Packed::evicted`,
+    /// 呼叫端(`lod_tree.rs` 的 `traverse_lod_trees`)在 pack 之後直接讀那個,不讀這裡。
     #[allow(dead_code)]
     pub(crate) evicted: u32,
     /// 這個 tick 被 D18 階層上界跳過的兄弟組數(spec D18)。

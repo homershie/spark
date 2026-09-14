@@ -7,8 +7,9 @@ use js_sys::{Array, Object, Reflect, Uint32Array};
 use wasm_bindgen::prelude::*;
 
 pub(crate) use crate::lod_splat::LodSplat;
+use crate::lod_cut::IncrementalCut;
 use crate::lod_traverse::{
-    expand_until, is_fresh, seed_roots, InstanceParams, LoopExit, RoundMeta, TraverseCore, TreeView,
+    expand_until, seed_roots, InstanceParams, LoopExit, TraverseCore, TreeView,
     MAX_INSTANCES, MAX_PAGED_INDEX,
 };
 
@@ -24,14 +25,12 @@ struct LodTree {
 struct LodState {
     next_id: u32,
     lod_trees: AHashMap<u32, LodTree>,
-    /// traverse 的跨呼叫狀態(frontier/output/touched);round 存活期間不 clear。
-    core: TraverseCore,
-    /// 原子呼叫(`budget_ms <= 0`,如 raycast 那條)專用的第二顆 core。原子路徑**不讀不寫**
-    /// `core` / `round`,所以旁路的原子 traverse 不會打斷切片中的 round(Task 5 review #1:
-    /// `lodRaycast` 預設開、每 500ms 一次,若共用 core 會讓 > 500ms 的 round 永遠跑不完)。
+    /// 原子路徑(`budget_ms <= 0` / `incremental=false`,含 raycast 那條旁路)專用的 core,
+    /// 每次呼叫 reset + 跑到底。原子路徑**不讀不寫** `cut`,所以旁路的原子 traverse 不會
+    /// 打斷正在累積的增量 cut(Task 5 review #1 的道理延續到方案 B)。
     scratch: TraverseCore,
-    /// 目前這一輪的固定參數;`None` = 沒有在跑的輪。
-    round: Option<RoundMeta>,
+    /// 方案 B:跨呼叫保留的增量 cut(`incremental=true` 的路徑)。
+    cut: IncrementalCut,
     buffer: Vec<u32>,
 }
 
@@ -40,9 +39,8 @@ impl LodState {
         Self {
             next_id: 1000,
             lod_trees: AHashMap::new(),
-            core: TraverseCore::default(),
             scratch: TraverseCore::default(),
-            round: None,
+            cut: IncrementalCut::new(),
             buffer: Vec::new(),
         }
     }
@@ -251,54 +249,21 @@ fn build_views<'a>(
     }).collect()
 }
 
-/// 在 `core` 上跑一片:`fresh` 時先 reset + seed roots,再 best-first 展開到 `budget_ms`
-/// 用完(`None` = 跑到底)。回 (迴圈怎麼結束, 這片花了幾 ms)。兩顆 core(切片 / 原子)共用。
-#[allow(clippy::too_many_arguments)]
-fn run_slice(
-    core: &mut TraverseCore, lod_trees: &AHashMap<u32, LodTree>,
-    lod_ids: &[u32], params: &[InstanceParams], root_pages: &[u32],
-    max_splats: usize, pixel_scale_limit: f32, fresh: bool, budget_ms: Option<f32>,
-) -> (LoopExit, f64) {
-    let borrows: Vec<Ref<Vec<LodSplat>>> = lod_ids.iter()
-        .map(|id| lod_trees.get(id).unwrap().splats.borrow())
-        .collect();
-    let trees = build_views(lod_trees, &borrows, lod_ids, params);
-
-    if fresh {
-        core.reset(max_splats);
-        seed_roots(core, &trees, root_pages);
-    }
-
-    // 每 4096 次 pop 才查一次時間(spec D4):跨 wasm→JS 邊界的 Date::now() 不能每個節點都叫。
-    let t0 = js_sys::Date::now();
-    let deadline = budget_ms.map(|b| t0 + b as f64);
-    let mut pops = 0u32;
-    let exit = expand_until(core, &trees, max_splats, pixel_scale_limit, &mut || {
-        pops = pops.wrapping_add(1);
-        pops & 4095 == 0 && deadline.is_some_and(|d| js_sys::Date::now() >= d)
-    });
-    let slice_ms = js_sys::Date::now() - t0;
-    drop(trees);
-    drop(borrows);
-    (exit, slice_ms)
+/// 原子 traverse:在 `scratch` core 上 reset + seed roots + best-first 展到 Done(無 deadline)。
+/// `budget_ms ≤ 0` 或 `incremental=false`(含 raycast 那條旁路)都走這裡,與 v2.1.0 逐位相同。
+/// `trees` 由呼叫端建好(借用 `lod_trees` 當下的資料),與方案 B 的 `cut.tick()` 共用同一份,
+/// 不必為了原子路徑再借一次。
+fn run_atomic(scratch: &mut TraverseCore, trees: &[TreeView], root_pages: &[u32], max_splats: usize, pixel_scale_limit: f32) {
+    scratch.reset(max_splats);
+    seed_roots(scratch, trees, root_pages);
+    let exit = expand_until(scratch, trees, max_splats, pixel_scale_limit, &mut || false);
+    debug_assert_eq!(exit, LoopExit::Done, "沒有 deadline 的 expand_until 只會以 Done 結束");
 }
 
-/// 把 `core` 目前的快照(output ∪ frontier,不 drain,spec D3)與累計 touched 打包成 JS 物件。
-fn pack_result(core: &TraverseCore, lod_ids: &[u32], done: bool, slice: u32, slice_ms: f64) -> Object {
-    let num_instances = lod_ids.len();
-    let output_size = core.output.len();
-    let frontier_size = core.frontier.len();
-    let cut = core.snapshot();
-
-    let mut instance_counts = vec![0usize; num_instances];
-    for &(inst_index, _) in cut.iter() {
-        instance_counts[inst_index as usize] += 1;
-    }
-    let mut instance_outputs: Vec<Vec<u32>> = instance_counts.iter().map(|&n| Vec::with_capacity(n)).collect();
-    for &(inst_index, paged_index) in cut.iter() {
-        instance_outputs[inst_index as usize].push(paged_index);
-    }
-
+/// 把每 instance 的 paged index 補到 16384 倍數、包成 `{lodId, numSplats, indices}` 的 `Array`。
+/// 原子路徑把 `TraverseCore::snapshot()` 攤成 `Vec<Vec<u32>>` 再呼叫;增量路徑直接餵
+/// `IncrementalCut::pack()` 的 `Packed::indices`——兩邊都是「每 instance 一份 paged index」。
+fn pack_indices(instance_outputs: Vec<Vec<u32>>, lod_ids: &[u32]) -> Array {
     let instance_indices = Array::new();
     for (inst_index, instance_output) in instance_outputs.iter().enumerate() {
         let rows = instance_output.len().div_ceil(16384);
@@ -312,32 +277,28 @@ fn pack_result(core: &TraverseCore, lod_ids: &[u32], done: bool, slice: u32, sli
         Reflect::set(&result, &JsValue::from_str("indices"), &JsValue::from(output)).unwrap();
         instance_indices.push(&JsValue::from(result));
     }
+    instance_indices
+}
 
-    // chunks = 本輪**累計**的 touched(不是這片新增的)—— 這是 pager 不釋放 cut 所用頁的前提(spec §4.5)。
+/// `(lod_id, chunk)` pairs → JS `Array` of `[lodId, chunk]` pairs。原子路徑餵 `scratch.touched`
+/// (本輪**累計**的 touched,不是這片新增的——這是 pager 不釋放 cut 所用頁的前提,spec §4.5);
+/// 增量路徑餵 `IncrementalCut::chunks()` 的 `Chunks::list`(roots / needed / wanted 三段)。
+fn pack_chunks(list: &[(u32, u32)]) -> Array {
     let out_chunks = Array::new();
-    for &(inst_index, chunk) in core.touched.iter() {
+    for &(lod_id, chunk) in list {
         let pair = Array::new();
-        pair.push(&JsValue::from(inst_index));
+        pair.push(&JsValue::from(lod_id));
         pair.push(&JsValue::from(chunk));
         out_chunks.push(&JsValue::from(pair));
     }
-
-    let result = Object::new();
-    Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(core.min_pixel_scale)).unwrap();
-    Reflect::set(&result, &JsValue::from_str("instanceIndices"), &JsValue::from(instance_indices)).unwrap();
-    Reflect::set(&result, &JsValue::from_str("chunks"), &JsValue::from(out_chunks)).unwrap();
-    Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(output_size)).unwrap();
-    Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(frontier_size)).unwrap();
-    Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(core.leaf_count)).unwrap();
-    Reflect::set(&result, &JsValue::from_str("done"), &JsValue::from(done)).unwrap();
-    Reflect::set(&result, &JsValue::from_str("slice"), &JsValue::from(slice)).unwrap();
-    Reflect::set(&result, &JsValue::from_str("sliceMs"), &JsValue::from(slice_ms)).unwrap();
-    result
+    out_chunks
 }
 
-/// 可續跑的 traverse。`budget_ms <= 0` = 原子(在獨立的 `scratch` core 上跑到底,**不碰**
-/// `core` / `round`,與 v2.1.0 逐位相同);`budget_ms > 0` = 切片,在 `core` 上按 `round` 續跑;
-/// `restart` = 丟掉現有 round 從 root 重開。設計見本專案 spec §4。
+/// 原子(`budget_ms ≤ 0` 或 `incremental=false`)/ 增量(`IncrementalCut::tick`,方案 B)分流。
+/// 切片 round 路徑(`RoundMeta` / `is_fresh` / `run_slice`)已刪除——增量路徑要不要從 root
+/// 重開,由 `IncrementalCut::tick`(內部呼叫 `restart`)依 instance 集合是否變了自己判斷,
+/// 呼叫端不用再傳 `restart` 旗標。設計見本專案 spec §4、task brief(方案 B Task 4)。
+#[allow(clippy::too_many_arguments)]
 #[wasm_bindgen]
 pub fn traverse_lod_trees(
     max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
@@ -345,7 +306,7 @@ pub fn traverse_lod_trees(
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
-    budget_ms: f32, restart: bool,
+    budget_ms: f32, incremental: bool, hysteresis: f32,
 ) -> anyhow::Result<Object, JsValue> {
     let num_instances = lod_ids.len();
     if view_to_objects.len() != num_instances * 16 {
@@ -371,7 +332,8 @@ pub fn traverse_lod_trees(
         return Err(JsValue::from_str(&format!("Too many LoD instances: {num_instances} > {MAX_INSTANCES}")));
     }
 
-    // 這次呼叫自己的姿態 / foveation 參數(切片模式只在 round 開始時算一次、之後沿用 round 的)。
+    // 這次呼叫自己的姿態 / foveation 參數(每次呼叫都重算——相機每幀在動;增量路徑姿態變了
+    // 與否由 `IncrementalCut::tick` 自己比對 `self.params`,呼叫端不用記上一次的)。
     let make_params = || -> Vec<InstanceParams> {
         (0..num_instances).map(|index| {
             let i16 = index * 16;
@@ -392,7 +354,7 @@ pub fn traverse_lod_trees(
     };
 
     STATE.with_borrow_mut(|state| {
-        let LodState { lod_trees, core, scratch, round, .. } = state;
+        let LodState { lod_trees, scratch, cut, .. } = state;
 
         for id in lod_ids {
             let n = lod_trees.get(id).map_or(0, |t| t.splats.borrow().len());
@@ -403,40 +365,69 @@ pub fn traverse_lod_trees(
             }
         }
 
-        if budget_ms <= 0.0 {
-            // 原子模式:自己的參數、自己的 core、跑到底。`core` / `round` 原封不動,
-            // 所以 raycast 那條旁路呼叫不會讓切片中的 round 失效(Task 5 review #1)。
-            let params = make_params();
-            let (exit, slice_ms) = run_slice(
-                scratch, lod_trees, lod_ids, &params, root_pages,
-                max_splats as usize, pixel_scale_limit, true, None,
-            );
-            debug_assert_eq!(exit, LoopExit::Done, "沒有 deadline 的 expand_until 只會以 Done 結束");
-            return Ok(pack_result(scratch, lod_ids, true, 1, slice_ms));
+        let params = make_params();
+        let borrows: Vec<Ref<Vec<LodSplat>>> = lod_ids.iter().map(|id| lod_trees.get(id).unwrap().splats.borrow()).collect();
+        let trees = build_views(lod_trees, &borrows, lod_ids, &params);
+        let t0 = js_sys::Date::now();
+
+        if budget_ms <= 0.0 || !incremental {
+            // 原子模式:獨立的 `scratch` core、每次重開跑到底。與 v2.1.0 逐位相同,也不碰
+            // `cut`,所以旁路的原子呼叫(raycast)不會弄壞正在累積的增量 cut(Task 5 review #1
+            // 的道理延續到方案 B)。
+            run_atomic(scratch, &trees, root_pages, max_splats as usize, pixel_scale_limit);
+            let cut_vec = scratch.snapshot();
+            let mut outs: Vec<Vec<u32>> = lod_ids.iter().map(|_| Vec::new()).collect();
+            for &(inst, paged) in &cut_vec {
+                outs[inst as usize].push(paged);
+            }
+            let result = Object::new();
+            Reflect::set(&result, &JsValue::from_str("instanceIndices"), &pack_indices(outs, lod_ids)).unwrap();
+            Reflect::set(&result, &JsValue::from_str("chunks"), &pack_chunks(&scratch.touched)).unwrap();
+            Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(scratch.min_pixel_scale)).unwrap();
+            Reflect::set(&result, &JsValue::from_str("neededChunks"), &JsValue::from(scratch.touched.len() as u32)).unwrap();
+            Reflect::set(&result, &JsValue::from_str("done"), &JsValue::from(true)).unwrap();
+            Reflect::set(&result, &JsValue::from_str("tickMs"), &JsValue::from(js_sys::Date::now() - t0)).unwrap();
+            return Ok(result);
         }
 
-        // 切片模式。原子已在上面分流,所以 `is_fresh` 的 atomic 項固定給 false。
-        let fresh = is_fresh(false, restart, round.as_ref(), lod_ids);
-        if fresh {
-            *round = Some(RoundMeta {
-                lod_ids: lod_ids.to_vec(),
-                params: make_params(),
-                max_splats: max_splats as usize,
-                pixel_scale_limit,
-                slice: 0,
-                done: false,
-            });
-        }
-        let meta = round.as_mut().unwrap();
-
-        // 視圖用 **round 的姿態**(續跑不吃當幀相機)。
-        let (exit, slice_ms) = run_slice(
-            core, lod_trees, &meta.lod_ids, &meta.params, root_pages,
-            meta.max_splats, meta.pixel_scale_limit, fresh, Some(budget_ms),
+        // 增量模式(方案 B):掃描只拿 60% 預算(否則大 cut 的掃描把時間吃光、拆收永遠輪不到,
+        // spec §4.2);其餘階段(收/拆/門檻控制器)吃剩下的到 100%。
+        let scan_deadline = t0 + 0.6 * budget_ms as f64;
+        let deadline = t0 + budget_ms as f64;
+        let stats = cut.tick(
+            &trees, root_pages, max_splats as usize, pixel_scale_limit, hysteresis,
+            &mut || js_sys::Date::now() >= scan_deadline, &mut || js_sys::Date::now() >= deadline,
         );
-        meta.slice += 1;
-        meta.done = exit == LoopExit::Done;
+        // pack 之後才知道 evicted(頁被踢的洞);`TickStats::evicted` 是給 `tick()` 自己用的
+        // 佔位欄位(它本身不 pack),這裡算出來的才是真值,放進下面的 `tick` 物件。
+        let (indices, evicted) = if cut.needs_pack() {
+            let packed = cut.pack(&trees);
+            (JsValue::from(pack_indices(packed.indices, lod_ids)), packed.evicted)
+        } else {
+            (JsValue::NULL, 0)
+        };
+        let chunks = cut.chunks();
+        let result = Object::new();
+        Reflect::set(&result, &JsValue::from_str("instanceIndices"), &indices).unwrap();
+        Reflect::set(&result, &JsValue::from_str("chunks"), &pack_chunks(&chunks.list)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(stats.t)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("neededChunks"), &JsValue::from((chunks.roots + chunks.needed) as u32)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("done"), &JsValue::from(stats.settled)).unwrap();
 
-        Ok(pack_result(core, &meta.lod_ids, meta.done, meta.slice, slice_ms))
+        let tick = Object::new();
+        for (k, v) in [
+            ("scanned", stats.scanned as f64), ("expanded", stats.expanded as f64), ("collapsed", stats.collapsed as f64),
+            ("passes", stats.passes as f64), ("evicted", evicted as f64), ("wantedCount", stats.wanted_count as f64),
+            ("cutSize", stats.cut_size as f64), ("t", stats.t as f64), ("arenaLeaked", stats.arena_leaked as f64),
+            ("boundSkipped", stats.bound_skipped as f64), ("tickMs", js_sys::Date::now() - t0),
+        ] {
+            Reflect::set(&tick, &JsValue::from_str(k), &JsValue::from(v)).unwrap();
+        }
+        Reflect::set(&tick, &JsValue::from_str("settled"), &JsValue::from(stats.settled)).unwrap();
+        Reflect::set(&tick, &JsValue::from_str("changed"), &JsValue::from(stats.changed)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("tick"), &tick).unwrap();
+        drop(trees);
+        drop(borrows);
+        Ok(result)
     })
 }

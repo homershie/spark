@@ -20,13 +20,8 @@ mod ext_splats;
 mod lod_splat;
 mod lod_tree;
 mod lod_traverse;
-// `IncrementalCut` 目前只被自己的 `#[cfg(test)]` 測試用到——`lod_tree.rs` 要到方案 B
-// 後續任務(tick 接上 traverse_lod_trees)才會消費它;在那之前 release/wasm build 沒有
-// `#[cfg(test)]`,這裡是真的死碼,故 allow 只在非 test build 生效(同 lod_splat.rs 的
-// `LodSplat::new` 那條先例)。Task 2 把 `tick`/`settled` 接上後,test build 下已經只剩
-// `TickStats::evicted`(Task 4 才會填)沒被讀到,改用該欄位自己的 `#[allow(dead_code)]`
-// 處理,不需要再靠這裡的 cfg_attr 蓋住整個 test build。
-#[cfg_attr(not(test), allow(dead_code))]
+// `IncrementalCut` 自方案 B Task 4 起被 `lod_tree.rs` 的 `traverse_lod_trees` 消費
+// (`incremental=true` 的路徑),release/wasm build 不再是死碼,不需要 cfg_attr 蓋住。
 mod lod_cut;
 #[cfg(test)]
 mod lod_synth;

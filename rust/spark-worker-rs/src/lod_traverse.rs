@@ -93,18 +93,6 @@ pub(crate) struct TraverseCore {
     pub(crate) leaf_count: u32,
 }
 
-/// 一輪(round)的固定參數:從「姿態變了、從 root 重開」到「跑完」。
-#[derive(Debug, Clone)]
-pub(crate) struct RoundMeta {
-    pub(crate) lod_ids: Vec<u32>,
-    pub(crate) params: Vec<InstanceParams>,
-    pub(crate) max_splats: usize,
-    pub(crate) pixel_scale_limit: f32,
-    /// 已跑過幾片(從 0 起;`traverse_lod_trees` 每跑完一片 +1)。
-    pub(crate) slice: u32,
-    pub(crate) done: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoopExit {
     /// 既有三個結束條件之一:frontier 空 / 最大節點已小於門檻 / 預算滿。
@@ -138,18 +126,6 @@ impl TraverseCore {
         cut.extend(self.frontier.iter().map(|e| (e.inst(), e.paged())));
         cut
     }
-}
-
-/// 這一輪要不要從 root 重開。`lod_ids` 不同 = instance 集合變了,`inst_index` 對不上,視同重開。
-/// `atomic` 項保留(一律重開),但 `lod_tree.rs` 的原子路徑現在走獨立的 scratch core、
-/// 不再經過這裡 —— 切片路徑固定傳 `false`。
-pub(crate) fn is_fresh(atomic: bool, restart: bool, round: Option<&RoundMeta>, lod_ids: &[u32]) -> bool {
-    atomic
-        || restart
-        || match round {
-            None => true,
-            Some(r) => r.done || r.lod_ids.as_slice() != lod_ids,
-        }
 }
 
 /// 把各 instance 的 root 放進 frontier(等同既有迴圈前的那段)。
@@ -783,23 +759,5 @@ pub(crate) mod tests {
         rebalance(&mut inc, &splats, &near, limit, max);
         assert_eq!(inc.nodes(), atomic.nodes());
         assert_parent_chain(&inc, &truth);
-    }
-
-    #[test]
-    fn is_fresh_rules() {
-        let meta = |done: bool, ids: &[u32]| RoundMeta {
-            lod_ids: ids.to_vec(),
-            params: vec![],
-            max_splats: 1,
-            pixel_scale_limit: 0.0,
-            slice: 1,
-            done,
-        };
-        assert!(is_fresh(true, false, Some(&meta(false, &[1])), &[1]), "atomic 一律重開");
-        assert!(is_fresh(false, true, Some(&meta(false, &[1])), &[1]), "restart 一律重開");
-        assert!(is_fresh(false, false, None, &[1]), "沒有 round 就重開");
-        assert!(is_fresh(false, false, Some(&meta(true, &[1])), &[1]), "上一輪已完成就重開");
-        assert!(is_fresh(false, false, Some(&meta(false, &[1])), &[1, 2]), "instance 集合變了就重開");
-        assert!(!is_fresh(false, false, Some(&meta(false, &[1, 2])), &[1, 2]), "同一輪未完成 → 續跑");
     }
 }
