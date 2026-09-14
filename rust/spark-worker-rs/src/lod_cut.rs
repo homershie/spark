@@ -36,6 +36,38 @@ const ARENA_BUCKETS: usize = 33;
 /// 掃描 / 拆時每幾筆查一次 deadline(A 的 D4)。
 const DEADLINE_STRIDE: u32 = 4096;
 
+/// D21 ps 直方圖的桶數。範圍是 `[hist_lo, hist_hi]` = `[max(limit, up/2), up]`(最多一個八度),
+/// 對數等分 32 桶 → 每桶 ≈2.2%,比控制器的最小步幅 3% 細;桶數再多對「一步填滿」沒有幫助
+/// (D18 跳過組的 ps 只知道上界,精度本來就不到 1%)。
+pub(crate) const PS_HIST_BINS: usize = 32;
+/// `avg_gain`(每次成功展開淨增幾筆 cut)的 EMA 係數。冷啟動幾百次展開就收斂;之後只跟著樹的
+/// 局部分支數慢慢飄,不需要快。
+const AVG_GAIN_ALPHA: f32 = 1.0 / 32.0;
+
+/// D21:從「上一輪掃描記下的非候選 cut 葉 ps 直方圖」挑門檻。桶 `i` 的下緣 =
+/// `lo · (hi/lo)^(i/NB)`;從最上面的桶往下累加筆數,第一次累到 `need` 的那個桶的下緣就是答案
+/// (把 t 降到這裡,這些葉的 ps 都 > 新的 up,下一輪全部成為候選)。累完所有桶仍不到 `need`
+/// 回 `None`(呼叫端另外決定:直方圖裡有東西就全放,沒有就直接到 `lo`)。純函式,vitest 式
+/// 單元測試在 `tests` 模組。
+pub(crate) fn threshold_from_hist(hist: &[u32; PS_HIST_BINS], lo: f32, hi: f32, need: f32) -> Option<f32> {
+    let mut cum = 0u64;
+    for i in (0..PS_HIST_BINS).rev() {
+        cum += hist[i] as u64;
+        if cum as f32 >= need {
+            return Some(hist_bin_lower_edge(i, lo, hi));
+        }
+    }
+    None
+}
+
+/// 桶 `i` 的下緣(對數等分)。
+pub(crate) fn hist_bin_lower_edge(i: usize, lo: f32, hi: f32) -> f32 {
+    if i == 0 || hi <= lo {
+        return lo;
+    }
+    lo * (hi / lo).powf(i as f32 / PS_HIST_BINS as f32)
+}
+
 /// 展開過的節點。`child_count == 0` 且 `parent == NONE` 且不是 root ⇒ 已釋放(在 `node_free`)。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Node {
@@ -54,6 +86,10 @@ pub(crate) struct Node {
     /// ps 保守上界,上界 ≤ 拆門檻就整組跳過(spec D18)。
     pub(crate) radius: f16,
     pub(crate) child_size_max: f16,
+    /// 孩子裡是樹葉(`child_count == 0`,拆不了)的顆數(展開時算)。D21 直方圖對 D18 整組跳過的
+    /// 孩子只知道上界、不逐顆看,靠這個把拆不了的排除——不排除的話近場跳過組裡的樹葉會被算成
+    /// 「可拆的存量」,控制器以為門檻底下有一大堆可拆、每步只敢動 3%。
+    pub(crate) terminal_count: u16,
     /// pack 發現孩子頁被踢 → 下一 tick 無視 ps 收回(spec §4.4)。
     pub(crate) forced: bool,
     pub(crate) alive: bool,
@@ -168,6 +204,23 @@ pub(crate) struct IncrementalCut {
     /// misfit 之後的衰減,這面旗標其實摸不到；真正用得上它的是小樹 / 測試(child_count 相對
     /// max_splats 不是可忽略的量級,0.98 gate 擋不住)。
     misfit_pinned: bool,
+    /// D21:這一個「掃描窗」(自上次 `visited_since_change` 歸零以來)掃到的**非候選** cut 葉
+    /// (`CUT_LEAF` 且 ps ≤ up)的 ps 直方圖,桶的範圍 `[hist_lo, hist_hi]` 在窗開始的那個 tick
+    /// 固定(見 tick() 開頭)。D18 整組跳過的孩子只知道 ps 上界 `ps_max`,整組記在
+    /// `bin(min(ps_max, hi))`——高估它們的 ps,所以控制器挑出來的 t 偏保守(填不滿,下一輪再補),
+    /// 不會反向衝過頭。窗的邊界跟控制器的證據窗(`visited_since_change >= nodes.len()`)完全同一個:
+    /// 控制器要動 t 的那一刻,直方圖恰好是「目前 t 之下完整一輪」的資料,不需要另外記
+    /// 「上一個完成的 pass」。只在 `visited_since_change <= nodes.len()` 時記,窗掃完而沒重置
+    /// (例如 settled 之後 JS 又 tick)不會重複計數。
+    ps_hist: [u32; PS_HIST_BINS],
+    hist_lo: f32,
+    hist_hi: f32,
+    /// `PS_HIST_BINS / ln(hi/lo)`;hi ≤ lo(t 已在 limit,控制器本來就不會動)時為 0 → 全進桶 0。
+    hist_scale: f32,
+    hist_ln_lo: f32,
+    /// 每次成功展開淨增的 cut 筆數(`child_count − 1`)的 EMA;控制器用它把「預算缺口」換算成
+    /// 「要拆幾顆葉」。初值 4(build-lod 常見分支數 ≈5)。
+    avg_gain: f32,
 }
 
 impl IncrementalCut {
@@ -198,7 +251,34 @@ impl IncrementalCut {
             forced: Vec::new(),
             deadline_stride: DEADLINE_STRIDE,
             misfit_pinned: false,
+            ps_hist: [0; PS_HIST_BINS],
+            hist_lo: 0.0,
+            hist_hi: 0.0,
+            hist_scale: 0.0,
+            hist_ln_lo: 0.0,
+            avg_gain: 4.0,
         }
+    }
+
+    /// 掃描窗歸零:`visited_since_change` 與 D21 直方圖一起清(兩者是同一個窗,見 `ps_hist`)。
+    /// 所有原本直接寫 `visited_since_change = 0` 的地方都走這裡。
+    fn reset_scan_window(&mut self) {
+        self.visited_since_change = 0;
+        self.ps_hist = [0; PS_HIST_BINS];
+    }
+
+    /// D21:把一筆(或整組 `count` 筆)非候選 cut 葉記進直方圖。`ps ≤ hist_lo` → 桶 0;超過
+    /// `hist_hi` 夾到最上桶。每筆一次 `ln`(wasm 上 `f32::ln` 是軟體實作;walk 基準量過,
+    /// tick median 沒有可量到的退步,見 spec §7.2 D21 那列)。
+    #[inline]
+    fn hist_add(&mut self, ps: f32, count: u32) {
+        let idx = if ps <= self.hist_lo {
+            0
+        } else {
+            let f = (ps.ln() - self.hist_ln_lo) * self.hist_scale;
+            (f as usize).min(PS_HIST_BINS - 1)
+        };
+        self.ps_hist[idx] = self.ps_hist[idx].saturating_add(count);
     }
 
     // ── 樹的存取 ────────────────────────────────────────────────────────────
@@ -311,7 +391,7 @@ impl IncrementalCut {
         self.wanted.clear();
         self.lod_ids = trees.iter().map(|t| t.lod_id).collect();
         self.params = trees.iter().map(|t| t.params).collect();
-        self.visited_since_change = 0;
+        self.reset_scan_window();
         self.limit = limit;
         self.t = limit;
         self.generation += 1;
@@ -345,6 +425,7 @@ impl IncrementalCut {
                 size: root.size,
                 radius: f16::ZERO,
                 child_size_max: root.size,
+                terminal_count: if root.child_count == 0 { 1 } else { 0 },
                 forced: false,
                 alive: true,
                 queued: false,
@@ -401,10 +482,12 @@ impl IncrementalCut {
         let my_center = Vec3A::from_array(center.map(|x| x.to_f32()));
         let mut radius = 0.0f32;
         let mut child_size_max = 0.0f32;
+        let mut terminal_count = 0u16;
         for g in 0..child_count as u32 {
             let s = Self::splat_at(tree, child_start + g).expect("首尾 chunk 都 resident,中間不可能不 resident");
             radius = radius.max((s.center() - my_center).length());
             child_size_max = child_size_max.max(s.size());
+            terminal_count += (s.child_count == 0) as u16;
             self.arena[(base + g) as usize] = Child {
                 slot: if s.child_count == 0 { CUT_TERMINAL } else { CUT_LEAF },
                 center: s.center,
@@ -427,6 +510,7 @@ impl IncrementalCut {
             size,
             radius,
             child_size_max,
+            terminal_count,
             forced: false,
             alive: true,
             queued: false,
@@ -565,7 +649,7 @@ impl IncrementalCut {
         };
         let inst = inst as u8;
         if self.wanted.contains_key(&(inst, chunk)) {
-            self.visited_since_change = 0;
+            self.reset_scan_window();
         }
         if self.chunk_refs[inst as usize].get(&chunk).copied().unwrap_or(0) > 0 {
             self.tables_dirty = true;
@@ -660,7 +744,7 @@ impl IncrementalCut {
         let params: Vec<InstanceParams> = trees.iter().map(|t| t.params).collect();
         if params != self.params || max_splats != self.max_splats || limit != self.limit {
             self.params = params;
-            self.visited_since_change = 0;
+            self.reset_scan_window();
             // M5:params/max/limit 變了,heap 裡按舊門檻排的候選(ps 與其優先序)全部作廢,清掉
             // 免得之後用舊 ps 誤判(消費端不會重算 heap 裡存的 ps)。
             self.clear_expand_heap();
@@ -682,6 +766,17 @@ impl IncrementalCut {
         let up = self.t * (1.0 + eps);
         let down = self.t * (1.0 - eps);
         let limit_down = limit * (1.0 - eps);
+        // D21:掃描窗剛開始(還沒訪問任何 slot)就把直方圖的範圍釘在這一輪的 `[max(limit, up/2), up]`
+        // ——窗內 t/limit 都不會變(變了就是新窗),所以整窗的桶邊界一致。下限取 up/2 而不是 limit:
+        // 一步最多把 t 砍半(同 sqrt 規則的 0.5 下限,防止 cut 很空時一口氣衝到 limit 打開一大片
+        // misfit),把 32 桶的解析度全部用在真正會落腳的那一個八度。
+        if self.visited_since_change == 0 {
+            self.hist_lo = limit.max(up * 0.5);
+            self.hist_hi = up;
+            self.hist_ln_lo = self.hist_lo.ln();
+            let span = (self.hist_hi / self.hist_lo).ln();
+            self.hist_scale = if span > 1e-6 { PS_HIST_BINS as f32 / span } else { 0.0 };
+        }
 
         // ── 1. 掃描切片(最多一整 pass)──
         // over_budget:超預算時,收候選不能只靠 ps 掉到門檻以下才進 heap(D20「超預算從 ps 最小的收」)——
@@ -715,6 +810,8 @@ impl IncrementalCut {
             let slot = self.cursor as u32;
             self.cursor += 1;
             self.visited_since_change += 1;
+            // D21:窗掃完一整輪之後(settled 卻仍被 tick)不再記,免得同一顆葉重複計數。
+            let record = self.visited_since_change <= n;
             let node = self.nodes[slot as usize];
             if !node.alive {
                 continue;
@@ -729,14 +826,14 @@ impl IncrementalCut {
             //     M6:fov_max 取 `behind_foveate`/`cone_foveate` 與 1.0 的最大值(原本假設 foveate ≤ 1,
             //     若有人把場景設成 foveate > 1,這裡不跟著放大上界就不再保守)。
             let base = node.children_base as usize;
-            let skip_children = if node.parent == NONE {
-                false
+            let d = (Vec3A::from_array(node.center.map(|x| x.to_f32())) - p.origin).length();
+            let ps_max = if node.parent == NONE {
+                f32::INFINITY
             } else {
-                let d = (Vec3A::from_array(node.center.map(|x| x.to_f32())) - p.origin).length();
                 let fov_max = p.behind_foveate.max(p.cone_foveate).max(1.0);
-                let ps_max = p.lod_scale * node.child_size_max.to_f32() * fov_max / (d - node.radius.to_f32()).max(1.0e-6);
-                ps_max <= up
+                p.lod_scale * node.child_size_max.to_f32() * fov_max / (d - node.radius.to_f32()).max(1.0e-6)
             };
+            let skip_children = ps_max <= up;
             if !skip_children {
                 for i in 0..node.child_count as usize {
                     let c = self.arena[base + i];
@@ -750,10 +847,32 @@ impl IncrementalCut {
                     if ps > up {
                         self.expand_heap.push((OrderedFloat(ps), slot, i as u16, node.index));
                         self.arena[base + i].slot = CUT_QUEUED;
+                    } else if record {
+                        self.hist_add(ps, 1);
                     }
                 }
             } else {
                 st.bound_skipped += 1;
+                if record {
+                    // 整組孩子的 ps 沒逐顆算。估計值 = 這個 node 自己的(含 foveation 的)ps ×
+                    // 孩子/自己的 size 比 × d/(d−radius) —— 等於 `ps_max` 換掉裡面的 `fov_max`、改用
+                    // node 自己的 foveation。不能直接用 `ps_max`:它把背後(×0.2)/錐外(×0.4)的節點
+                    // 全當成正前方(×1),高估最多 5×,整個背後半球的組會被記進最上面幾桶,控制器
+                    // 以為 up 底下就有夠多可拆的、每步只敢動 3%(walk 基準實測,D21 第一版)。
+                    // 遠場孩子的 foveation ≈ parent 的(角度差 ≤ radius/d),仍是近似上界;偶爾低估
+                    // 只是多推幾個候選、misfit 釘住,一輪內自我修正。拆不了的樹葉(`terminal_count`)
+                    // 排除,剩下的才是可拆存量。
+                    let expandable = node.child_count - node.expanded - node.terminal_count;
+                    if expandable > 0 {
+                        let size = node.size.to_f32();
+                        let est = if size > 0.0 {
+                            node_ps * (node.child_size_max.to_f32() / size) * (d / (d - node.radius.to_f32()).max(1.0e-6))
+                        } else {
+                            ps_max
+                        };
+                        self.hist_add(est.min(self.hist_hi), expandable as u32);
+                    }
+                }
             }
             // `!node.queued`:同理,已經在 collapse_heap 排隊的 interior 不重推。
             if node.parent != NONE && node.expanded == 0 && !node.queued
@@ -854,6 +973,7 @@ impl IncrementalCut {
                     ExpandOutcome::Expanded(new_slot) => {
                         st.expanded += 1;
                         let nn = self.nodes[new_slot as usize];
+                        self.avg_gain += ((nn.child_count as f32 - 1.0) - self.avg_gain) * AVG_GAIN_ALPHA;
                         let p = &trees[nn.inst as usize].params;
                         for g in 0..nn.child_count as usize {
                             let c = self.arena[nn.children_base as usize + g];
@@ -918,16 +1038,21 @@ impl IncrementalCut {
             && (self.cut_size as f32) < 0.98 * self.max_splats as f32
             && !self.misfit_pinned
         {
-            // 衰減步幅依「離預算還有多遠」自適應(spec §4.5 amendment,手測 2026-09-14):固定 0.9
-            // 在停下後要 3–4 個 pass(~800ms)才填滿預算,肉眼看到分波次變細(將軍府桌機實測
-            // `settleMs.median` 815ms)。表面型資料 ps > t 的節點數大略隨 t^-2 成長,所以「一步就
-            // 填滿預算」的係數 ≈ sqrt(cut_size / max_splats)——目前 cut 離飽和(0.98·max)還有多遠,
-            // 開根號後就是那一步該乘的比例。`clamp(0.5, 0.97)`:下限 0.5 防止 cut 幾乎是空的時候
-            // (fill 很小)一步衝到 `limit`、瞬間把一大片 misfit 節點打開;上限 0.97 保證即使已經
-            // 到 97% 滿,這一步仍然有實質推進(不會退化成幾乎不動)。
-            let fill = self.cut_size as f32 / self.max_splats as f32;
-            let factor = fill.sqrt().clamp(0.5, 0.97);
-            self.t = (self.t * factor).max(limit);
+            // D21(手測 2026-09-14 第二輪):不再盲目幾何衰減(固定 0.9 → sqrt(fill) 自適應都是
+            // 「猜一步、掃一輪、再猜」,fill 0.94 時每步只降 3%,將軍府桌機停下後 cut 2.20M → 2.36M
+            // → 2.46M 拖了好幾秒、肉眼看得到分波次變細)。這一輪掃描已經順手把每顆非候選 cut 葉的
+            // ps 記進直方圖(`ps_hist`,見該欄位),預算缺口換算成「要拆幾顆葉」(`need`),從最上面
+            // 的桶往下累加,第一次累到 need 的那個桶的下緣就是新門檻——一步把 t 放到「剛好補滿」的
+            // 位置,下一輪那些葉全部成為候選、由 ps 大到小拆到 misfit 釘住為止。
+            // 直方圖累完仍不到 need:直接到 `hist_lo`(= max(limit, up/2),一步最多砍半)。桶 0 已經
+            // 把 ps ≤ lo 的全包了,所以「最低非空桶的下緣」跟 `lo` 放行的集合一模一樣,只是 lo 走得
+            // 更遠——下一輪的窗從更低的地方開始,離「填滿」更近。`/(1+eps)`:桶邊緣是 ps,門檻要讓
+            // up = 邊緣。`.min(0.97·t)`:再怎麼樣至少動 3%(桶粒度 2.2% 之下最上桶的下緣可能不到
+            // 3%);`.max(limit)`:同原本的下限。永遠不會往上調(桶的範圍 ≤ up)。
+            let need = (self.max_splats - self.cut_size) as f32 / self.avg_gain.max(1.0);
+            let picked = threshold_from_hist(&self.ps_hist, self.hist_lo, self.hist_hi, need).unwrap_or(self.hist_lo);
+            let t_new = picked / (1.0 + eps);
+            self.t = t_new.min(self.t * 0.97).max(limit);
         }
         if self.t < limit {
             self.t = limit;
@@ -938,7 +1063,7 @@ impl IncrementalCut {
         // 這個 tick 掃描累積的「已訪問」是用舊集合 / 舊門檻掃的,不能代表新狀態下已經掃完一輪。
         let changed = self.generation != gen0;
         if changed || self.t != t0 {
-            self.visited_since_change = 0;
+            self.reset_scan_window();
         }
 
         st.passes = self.passes;
@@ -1008,6 +1133,42 @@ mod tests {
             }
             assert_eq!(covered, 1, "葉 {leaf} 被 {covered} 個祖先代表");
         }
+    }
+
+    /// D21 純函式:(a) 筆數集中在最上桶、need ≤ 該筆數 → 最上桶下緣;(b) need 跨三桶 → 由上數第三桶
+    /// 的下緣;(c) need 大於總筆數 → None。桶下緣 = lo·(hi/lo)^(i/NB)。
+    #[test]
+    fn threshold_from_hist_picks_bin_lower_edge() {
+        let (lo, hi) = (0.5f32, 1.0f32);
+        let edge = |i: usize| hist_bin_lower_edge(i, lo, hi);
+        let top = PS_HIST_BINS - 1;
+        // (a)
+        let mut h = [0u32; PS_HIST_BINS];
+        h[top] = 100;
+        h[top - 5] = 7;
+        let got = threshold_from_hist(&h, lo, hi, 100.0).expect("最上桶就夠");
+        assert!((got - edge(top)).abs() < 1e-6, "got={got} expected={}", edge(top));
+        assert!((got - 0.5 * 2f32.powf(31.0 / 32.0)).abs() < 1e-6);
+        assert!(threshold_from_hist(&h, lo, hi, 1.0).is_some_and(|t| (t - edge(top)).abs() < 1e-6));
+        // (b) 三桶:10 + 10 + 10,need 25 → 第三桶
+        let mut h = [0u32; PS_HIST_BINS];
+        h[top] = 10;
+        h[top - 1] = 10;
+        h[top - 2] = 10;
+        h[0] = 1000;
+        let got = threshold_from_hist(&h, lo, hi, 25.0).expect("三桶夠");
+        assert!((got - edge(top - 2)).abs() < 1e-6, "got={got} expected={}", edge(top - 2));
+        assert!(threshold_from_hist(&h, lo, hi, 20.0).is_some_and(|t| (t - edge(top - 1)).abs() < 1e-6));
+        // 桶 0 的下緣就是 lo
+        assert!(threshold_from_hist(&h, lo, hi, 31.0).is_some_and(|t| (t - lo).abs() < 1e-6));
+        // (c)
+        let mut h = [0u32; PS_HIST_BINS];
+        h[3] = 5;
+        h[17] = 5;
+        assert_eq!(threshold_from_hist(&h, lo, hi, 11.0), None);
+        assert_eq!(threshold_from_hist(&[0; PS_HIST_BINS], lo, hi, 1.0), None);
+        // hi ≤ lo(退化):任何桶的下緣都是 lo,不會 NaN
+        assert_eq!(hist_bin_lower_edge(5, 1.0, 1.0), 1.0);
     }
 
     #[test]
@@ -1256,11 +1417,13 @@ mod tests {
         assert_valid(&cut, &parent);
     }
 
-    /// spec §4.5 amendment(手測 2026-09-14,將軍府桌機 settleMs.median 815ms):衰減步幅改依
-    /// `sqrt(cut_size / max_splats)`(clamp 0.5–0.97)取代固定 0.9。先在小預算(30)把 t misfit-pin
-    /// 住,再把預算放大到 1000(cut 相對新預算的 fill = 28/1000 → 開根號後夾在下限 0.5)—— 固定 0.9
-    /// 規則下這一個 tick 後 t 只會降到 0.9×t_before(RED);自適應規則應該一次就降到 ≤0.5×t_before
-    /// (斷言留 0.6× 當寬容邊界)。
+    /// spec §4.5 amendment(手測 2026-09-14,將軍府桌機 settleMs.median 815ms):衰減步幅不再是固定
+    /// 0.9。先在小預算(30)把 t misfit-pin 住,再把預算放大到 1000(fill = 28/1000)—— 固定 0.9
+    /// 規則下這一個 tick 後 t 只會降到 0.9×t_before(RED);自適應規則應該一次就降到 ≤0.6×t_before。
+    /// D21 之後這一步由直方圖決定:`need`(972/avg_gain)遠大於直方圖裡的筆數 → 「全放」分支,t 落到
+    /// `hist_lo`——那必須 (a) ≤ 剩下 12 顆 L2 的最小 ps(下一輪全部成為候選),(b) ≥ 0.5×t_before
+    /// (一步最多砍半的下限,從 sqrt 規則的 clamp 0.5 沿用,見 `hist_lo`)。原本「精確等於
+    /// t_before × clamp(sqrt(fill), 0.5, 0.97)」的斷言隨 sqrt 規則一起退役,≤0.6× 那條保留。
     #[test]
     fn inc_decay_step_scales_with_fill() {
         let (splats, _parent) = build_tree();
@@ -1288,14 +1451,19 @@ mod tests {
             cut.cut_size, cut_size_before,
             "這個 tick 內不應該真的展開(misfit 候選 ps == t_before,不大於 up,不會重新排隊)"
         );
-        let fill = cut_size_before as f32 / 1000.0;
-        let expected_factor = fill.sqrt().clamp(0.5, 0.97);
-        assert!((expected_factor - 0.5).abs() < 1e-6, "fill={fill} 應該夾在下限 0.5");
+        let l2_ps_min = (5..=20u32)
+            .map(|i| crate::lod_traverse::compute_pixel_scale(&splats[i as usize], &near))
+            .fold(f32::INFINITY, f32::min);
         assert!(
-            (cut.t - t_before * expected_factor).abs() < 1e-6,
-            "衰減後的 t 應該精確等於 t_before × clamp(sqrt(fill), 0.5, 0.97):t={} 預期={}",
+            cut.t <= l2_ps_min,
+            "D21:need 遠大於直方圖筆數 → 全放,t 應落到剩餘 L2 的最小 ps 之下:t={} L2 min ps={l2_ps_min}",
+            cut.t
+        );
+        assert!(
+            cut.t >= 0.5 * t_before,
+            "D21:一步最多砍半(hist_lo = max(limit, up/2)):t={} 0.5×t_before={}",
             cut.t,
-            t_before * expected_factor
+            0.5 * t_before
         );
         assert!(
             cut.t <= 0.6 * t_before,
@@ -1303,6 +1471,63 @@ mod tests {
             cut.t,
             0.6 * t_before
         );
+    }
+
+    /// spec D21(手測 2026-09-14 第二輪,將軍府桌機):停下後 cut 2.20M → 2.36M → 2.46M 分好幾個
+    /// pass 才填滿,每步只降 3%(fill 0.94 → clamp 上限 0.97)。改用掃描時順手記的 ps 直方圖,
+    /// 一次把 t 挑到「剛好補滿預算缺口」的位置。兩個情境:
+    /// (1) 遠離飽和(28/1000):t 應直接跳到剩餘 L2 的 ps 之下(≈0.038–0.04),≤3 tick 到 64。
+    /// (2) 近飽和(28/31,fill 0.90,eps 0.1):sqrt 規則給 0.95·t,但 up = 1.1×0.95 = 1.045·t
+    ///     還在 misfit 節點(ps == t)之上 → 那一 tick 什麼都拆不了、下一輪再降一次才到(RED:
+    ///     要 3 tick);直方圖看得到那 12 顆 L2 全在 (0.95t, t] 這一帶,一步就把 t 挑到讓
+    ///     至少一顆進候選 → 2 tick 內到 31(然後下一顆 misfit 釘住)。
+    #[test]
+    fn inc_decay_jumps_to_fill_in_one_pass() {
+        let (splats, parent) = build_tree();
+        let c2p = [0u32];
+        let limit = 0.03;
+        let near = pose(Vec3A::new(3.0, 0.0, -50.0));
+        let trees = views_p(&splats, &c2p, near);
+        let l2_ps_max = (5..=20u32)
+            .map(|i| crate::lod_traverse::compute_pixel_scale(&splats[i as usize], &near))
+            .fold(0.0f32, f32::max);
+
+        // (1) 28/1000
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], limit);
+        settle(&mut cut, &trees, 30, limit, 0.0);
+        assert_eq!(cut.cut_size, 28);
+        let mut trace = Vec::new();
+        let mut reached = None;
+        for k in 1..=6 {
+            let st = cut.tick(&trees, &[0], 1000, limit, 0.0, &mut || false, &mut || false);
+            trace.push((k, st.t, st.cut_size));
+            if k == 1 {
+                assert!(
+                    st.t <= l2_ps_max,
+                    "第一個衰減 tick 之後 t 應已落在 L2 的 ps 之下(直接跳到剩餘節點所在):t={} L2 max ps={l2_ps_max} trace={trace:?}",
+                    st.t
+                );
+            }
+            if st.cut_size == 64 { reached = Some(k); break; }
+        }
+        assert!(reached.is_some_and(|k| k <= 3), "28→64 應 ≤3 tick:trace(tick, t, cut)={trace:?}");
+        assert_valid(&cut, &parent);
+
+        // (2) 28/31,eps 0.1
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], limit);
+        settle(&mut cut, &trees, 30, limit, 0.0);
+        assert_eq!(cut.cut_size, 28);
+        let mut trace = Vec::new();
+        let mut reached = None;
+        for k in 1..=4 {
+            let st = cut.tick(&trees, &[0], 31, limit, 0.1, &mut || false, &mut || false);
+            trace.push((k, st.t, st.cut_size));
+            if st.cut_size == 31 { reached = Some(k); break; }
+        }
+        assert!(reached.is_some_and(|k| k <= 2), "28→31(fill 0.90)應 ≤2 tick:trace(tick, t, cut)={trace:?}");
+        assert_valid(&cut, &parent);
     }
 
     /// deadline 每筆就停:每個 tick 之後都是合法 cut、不超預算,最終仍收斂到原子。
