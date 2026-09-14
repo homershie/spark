@@ -247,16 +247,30 @@ pub(crate) fn bench_main(rounds: usize) {
 /// `all_tick`/`all_pack`(這兩份統計代表「走路中途轉頭一次」的穩態成本,冷啟動混進去會把
 /// p90 拉到失真)。
 ///
-/// `eps` = 遲滯帶(`cut.tick` 的 hysteresis 參數,production/預設 0.15);`diag` 開啟時
-/// 每站結束多印一行 `t`/`cut_size`/該站姿態下的原子 cut 大小,用來判斷 Jaccard 沒達標
-/// 是遲滯帶本身的結構性差距,還是 `t` 卡在真正均衡點之上(Task 5 review round 2 的診斷,
-/// 見 `docs/superpowers/specs/2026-09-11-incremental-traverse-design.md` §7.2)。
+/// `eps` = 遲滯帶(`cut.tick` 的 hysteresis 參數,production/預設 0.05,spec D6 2026-09-14
+/// 更新——0.15 只留 85% 與原子的重疊,0.05 有 95–98%);`diag` 開啟時每站結束多印一行
+/// `t`/`cut_size`/該站姿態下的原子 cut 大小(Task 5 review round 2 的診斷,見
+/// `docs/superpowers/specs/2026-09-11-incremental-traverse-design.md` §7.2)。
+///
+/// ⚠️ **Jaccard ≥ 0.93 這道 `assert!` 只在 `eps == 0.0` 才是「跟原子等價」的判準**
+/// (Task 5 review round 2 的裁決,門檻值由 0.97 下修為 0.93):`eps > 0` 時遲滯帶內的
+/// 節點依定義就是不動的,增量 cut 跟零遲滯的原子參考本來就會有結構性差距,不是缺陷,
+/// 只印 `(eps>0, informational)`,不斷言。**`eps == 0` 時殘留的 3–5% membership 差距
+/// 也不是缺陷**,是 spec §4.5 已經記錄的固有分岔:原子是「第一個裝不下就停」(greedy,
+/// 貪婪展到 budget 用完的那一刻,不看有沒有更接近均衡),增量是「`t` = misfit 的
+/// ps」(用上一次裝不下的候選 ps 當門檻,逼近但不等於同一個均衡點)——兩條路徑在
+/// **門檻帶上的邊界節點**(最遠即將被收的、最小即將被拆的那一小撮)取捨不同,count
+/// 幾乎相同、差的正是這批邊界節點。`eps = 0` 本身也是退化設定(遲滯帶寬度 0),
+/// 可能讓貼著門檻的節點在展開/收回之間平手乒乓、不容易乾淨 `settled`(故 settle 上限
+/// 給到 200)。**不論 eps 為何都斷言** `cut.cut_size >= 0.95·max`(spec 的品質下限,
+/// 見 §7.1 `synth_inc_walk`)——這條與遲滯帶/門檻分岔無關,純粹檢查有沒有把預算用滿。
 #[allow(dead_code)]
 pub(crate) fn walk_main(rounds: usize, eps: f32, diag: bool) {
     use crate::lod_cut::IncrementalCut;
     use std::time::Instant;
     const COLD_START_TICK_CAP: u32 = 400;
-    const NORMAL_TICK_CAP: u32 = 60;
+    // wasm 在 eps=0 需要 > 60 tick 才收斂(Task 5 review round 1/2 實測);200 給足餘裕。
+    const NORMAL_TICK_CAP: u32 = 200;
     let tree = build_synth(7, 256 * CHUNK, 256.0);
     let (splats, c2p, root_page) = page_out(&tree);
     let mut cut = IncrementalCut::new();
@@ -324,7 +338,7 @@ pub(crate) fn walk_main(rounds: usize, eps: f32, diag: bool) {
     eprintln!("WALK: tick median {:.1} p90 {:.1} ms | pack median {:.1} ms | settle ticks median {} max {} | cut {}",
         med(&mut all_tick.clone()), p90(&mut all_tick.clone()), med(&mut all_pack.clone()),
         settle_ticks[settle_ticks.len() / 2], settle_ticks.last().unwrap(), cut.cut_size);
-    // 品質下限(spec §7.1 synth_inc_walk):最後一站的增量 cut 與原子 cut 的 Jaccard ≥ 0.97
+    // 品質下限(spec §7.1 synth_inc_walk):最後一站的增量 cut 與原子 cut 的 Jaccard ≥ 0.93(eps=0)
     let (last_origin, last_yaw) = last;
     let forward = Vec3A::new(last_yaw.sin(), 0.0, last_yaw.cos());
     let p_last = params(last_origin, forward);
@@ -334,8 +348,30 @@ pub(crate) fn walk_main(rounds: usize, eps: f32, diag: bool) {
     let at: AHashSet<u32> = atomic.into_iter().collect();
     let inter = inc.intersection(&at).count() as f64;
     let j = inter / (inc.len() as f64 + at.len() as f64 - inter);
-    eprintln!("JACCARD vs atomic: {j:.3}  (inc {} atomic {})", inc.len(), at.len());
-    assert!(j >= 0.97, "增量 cut 與原子差太多:{j:.3}");
+    // Jaccard 只在 eps == 0.0 才是「跟原子等價」的判準(遲滯帶內的節點依定義不動,
+    // eps > 0 時本來就會跟零遲滯的原子參考有結構性差距,不是缺陷)——Task 5 review
+    // round 2 裁決:eps > 0 只印、不斷言。
+    //
+    // eps == 0 時門檻是 0.93,不是 1.0(甚至不是原本的 0.97):原子「第一個裝不下就
+    // 停」(greedy,貪婪展到 budget 用完那一刻,不管有沒有更接近均衡)vs 增量「t =
+    // misfit 的 ps」(用上一次裝不下的候選 ps 當門檻,逼近但不等於同一個均衡點)——
+    // 這是 spec §4.5 已經記錄的固有分岔,兩條路徑在門檻帶上的邊界節點(最遠即將被
+    // 收的、最小即將被拆的那一小撮)取捨不同,count 幾乎相同、差的正是這批邊界節點,
+    // 不是缺陷。`eps = 0` 本身也是退化設定,貼著門檻的節點可能在展開/收回之間平手
+    // 乒乓、不容易乾淨 settled(這也是 settle 上限給到 200 的理由)。
+    if eps == 0.0 {
+        eprintln!("JACCARD vs atomic: {j:.3}  (inc {} atomic {})", inc.len(), at.len());
+        assert!(j >= 0.93, "增量 cut 與原子差太多:{j:.3}");
+    } else {
+        eprintln!("JACCARD vs atomic: {j:.3}  (inc {} atomic {})  (eps>0, informational)", inc.len(), at.len());
+    }
+    // 品質下限(spec §7.1 synth_inc_walk):不論 eps 為何,最後一站的 cut 都不該明顯小於
+    // 預算——這條跟遲滯帶無關,遲滯只影響「跟原子精確重疊多少」,不影響「有沒有把預算用滿」。
+    assert!(
+        cut.cut_size >= (0.95 * max as f64) as usize,
+        "cut_size {} 明顯小於預算(0.95×max = {}),沒用滿預算",
+        cut.cut_size, (0.95 * max as f64) as usize
+    );
 }
 
 #[cfg(test)]

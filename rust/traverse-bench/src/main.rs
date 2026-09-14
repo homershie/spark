@@ -14,9 +14,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("walk") {
         let rounds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-        // args[3] = eps(遲滯帶,預設 0.15 = production 值);args[4] = "1" 開 per-station
-        // t/cut_size/atomic 診斷(Task 5 review round 2,見 lod_synth.rs::walk_main 文件)。
-        let eps = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.15);
+        // args[3] = eps(遲滯帶,預設 0.05 = production 值,spec D6 2026-09-14 更新);
+        // args[4] = "1" 開 per-station t/cut_size/atomic 診斷(Task 5 review round 2,
+        // 見 lod_synth.rs::walk_main 文件)。
+        let eps = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.05);
         let diag = args.get(4).map(String::as_str) == Some("1");
         lod_synth::walk_main(rounds, eps, diag);
     } else {
