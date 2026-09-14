@@ -321,6 +321,13 @@ fn pack_chunks(list: &[(u32, u32)]) -> Array {
 /// 切片 round 路徑(`RoundMeta` / `is_fresh` / `run_slice`)已刪除——增量路徑要不要從 root
 /// 重開,由 `IncrementalCut::tick`(內部呼叫 `restart`)依 instance 集合是否變了自己判斷,
 /// 呼叫端不用再傳 `restart` 旗標。設計見本專案 spec §4、task brief(方案 B Task 4)。
+///
+/// `pack_now`(D22):增量路徑只在 `pack_now && needs_pack()` 時才 pack `instanceIndices`,否則
+/// 回 `null`。JS 依 `lodApplyIntervalMs` 節流上傳,兩次上傳之間的 pack 是白做的(10M 的 cut 一次
+/// 20+ms wasm),且做了也只是被下一份蓋掉;所以由呼叫端在「這次真的會套進 GPU」時才要。
+/// `chunks` / `tick` 讀數每次都回;`needsPack` 回「這次呼叫之後,cut 是否仍與上一次交出去的 pack
+/// 不同」——true 代表螢幕上那份已經過期,JS 的 fetchPriority 得把它用到的 chunks 一併保住
+/// (spec §4.5 不變式 2,見 `SparkRenderer.updateLodInstances`)。原子路徑忽略 `pack_now`(永遠 pack)。
 #[allow(clippy::too_many_arguments)]
 #[wasm_bindgen]
 pub fn traverse_lod_trees(
@@ -329,7 +336,7 @@ pub fn traverse_lod_trees(
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
-    budget_ms: f32, incremental: bool, hysteresis: f32,
+    budget_ms: f32, incremental: bool, hysteresis: f32, pack_now: bool,
 ) -> anyhow::Result<Object, JsValue> {
     let num_instances = lod_ids.len();
     if view_to_objects.len() != num_instances * 16 {
@@ -406,6 +413,7 @@ pub fn traverse_lod_trees(
             let result = Object::new();
             Reflect::set(&result, &JsValue::from_str("instanceIndices"), &pack_indices(outs, lod_ids)).unwrap();
             Reflect::set(&result, &JsValue::from_str("chunks"), &pack_chunks(&scratch.touched)).unwrap();
+            Reflect::set(&result, &JsValue::from_str("needsPack"), &JsValue::from(false)).unwrap();
             Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(scratch.min_pixel_scale)).unwrap();
             Reflect::set(&result, &JsValue::from_str("neededChunks"), &JsValue::from(scratch.touched.len() as u32)).unwrap();
             Reflect::set(&result, &JsValue::from_str("done"), &JsValue::from(true)).unwrap();
@@ -423,15 +431,18 @@ pub fn traverse_lod_trees(
         );
         // pack 之後才知道 evicted(頁被踢的洞);`TickStats::evicted` 是給 `tick()` 自己用的
         // 佔位欄位(它本身不 pack),這裡算出來的才是真值,放進下面的 `tick` 物件。
-        let (indices, evicted) = if cut.needs_pack() {
+        let (indices, evicted) = if pack_now && cut.needs_pack() {
             let packed = cut.pack(&trees);
             (JsValue::from(pack_indices(packed.indices, lod_ids)), packed.evicted)
         } else {
             (JsValue::NULL, 0)
         };
+        // pack 之後再問:剛 pack 過 → false;沒 pack(`pack_now=false` 或本來就不髒)→ 照實回。
+        let needs_pack = cut.needs_pack();
         let chunks = cut.chunks();
         let result = Object::new();
         Reflect::set(&result, &JsValue::from_str("instanceIndices"), &indices).unwrap();
+        Reflect::set(&result, &JsValue::from_str("needsPack"), &JsValue::from(needs_pack)).unwrap();
         Reflect::set(&result, &JsValue::from_str("chunks"), &pack_chunks(&chunks.list)).unwrap();
         Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(stats.t)).unwrap();
         Reflect::set(&result, &JsValue::from_str("neededChunks"), &JsValue::from((chunks.roots + chunks.needed) as u32)).unwrap();
@@ -448,6 +459,8 @@ pub fn traverse_lod_trees(
         }
         Reflect::set(&tick, &JsValue::from_str("settled"), &JsValue::from(stats.settled)).unwrap();
         Reflect::set(&tick, &JsValue::from_str("changed"), &JsValue::from(stats.changed)).unwrap();
+        Reflect::set(&tick, &JsValue::from_str("packed"), &JsValue::from(!indices.is_null())).unwrap();
+        Reflect::set(&tick, &JsValue::from_str("needsPack"), &JsValue::from(needs_pack)).unwrap();
         Reflect::set(&result, &JsValue::from_str("tick"), &tick).unwrap();
         drop(trees);
         drop(borrows);

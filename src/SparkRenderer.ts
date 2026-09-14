@@ -219,7 +219,10 @@ export interface SparkRendererOptions {
   lodTickMs?: number;
   /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
   lodHysteresis?: number;
-  /** 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。 */
+  /**
+   * 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。D22:到期前的 tick 連 worker 端的
+   * pack 都省掉(`packNow=false`),不只是延後上傳。
+   */
   lodApplyIntervalMs?: number;
   /**
    * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
@@ -416,7 +419,10 @@ export class SparkRenderer extends THREE.Mesh {
   lodTickMs: number;
   /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
   lodHysteresis: number;
-  /** 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。 */
+  /**
+   * 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。D22:到期前的 tick 連 worker 端的
+   * pack 都省掉(`packNow=false`),不只是延後上傳。
+   */
   lodApplyIntervalMs: number;
   /** 最近一次 tick 的讀數;null = 還沒 tick 過。 */
   lastLodTick:
@@ -428,18 +434,23 @@ export class SparkRenderer extends THREE.Mesh {
   lodSettleMs: number | null = null;
   /** 最近一次姿態變髒的 performance.now();用於量測 lodSettleMs。 */
   private lodPoseDirtyAt = 0;
-  /** 上一次把 lodPendingIndices 套進 GPU 的 performance.now()(節流用)。 */
+  /**
+   * 上一次「要 worker pack、並把回來的索引套進 GPU」的 performance.now()(節流用)。
+   * D22 的契約:節流不再是「worker 每次都 pack、JS 把多餘的暫存」,而是**JS 到期才叫 worker
+   * pack**(`packNow`),回來的索引一律立刻套——沒有 pending 這一層了。
+   */
   private lodLastApplyAt = 0;
-  /** 被節流延後、還沒套進 GPU 的最新一份索引;下次到期的幀套用。 */
-  private lodPendingIndices: Record<
-    string,
-    { lodId: number; numSplats: number; indices: Uint32Array }
-  > | null = null;
-  private lodPendingUuidToMesh: Map<string, SplatMesh> | null = null;
-  /** 目前**螢幕上顯示**那份 cut 帶的 chunks(不是最新 tick 的 —— 節流期間兩者可能不同)。 */
+  /**
+   * 目前**螢幕上顯示**那份 cut 帶的 chunks。兩次套用之間 worker 仍在拆收,最新 tick 的 `chunks`
+   * 是「最新表」的投影,可能已經不含螢幕上那份用到的某個 chunk;`lodCutStale` 為 true 時
+   * fetchPriority 得把這份排最前面保住(spec §4.5 不變式 2)。
+   */
   private lodAppliedChunks: [number, number][] = [];
-  /** 被節流延後、還沒套進 GPU 那份索引所帶的 chunks;套用時併入 lodAppliedChunks。 */
-  private lodPendingChunks: [number, number][] | null = null;
+  /**
+   * D22:最近一次 tick 回報的 `needsPack`——true = cut 已經跟螢幕上那份(上一次交出去的 pack)
+   * 不同、還沒重 pack。原子路徑恆 false。
+   */
+  private lodCutStale = false;
   /** 頁面更新到了,會讓下面的 needTick 在這一幀強制 tick 一次(不等 settled);見 driveLod。 */
   lodTreeDirty = false;
   lodInflate: boolean;
@@ -1433,12 +1444,14 @@ export class SparkRenderer extends THREE.Mesh {
       // ── 方案 B:髒了、或 cut 還沒 settled,就 tick 一次(spec §5.2)──
       const frameNow = performance.now();
       const anyDirty = this.lodDirty;
+      // D22:`lodCutStale`(cut 已變、但螢幕上那份還沒重 pack)也要 tick——不然「節流中的那個
+      // tick 剛好 settled」會讓 JS 停止 tick,pack 永遠不會發生、螢幕停在舊 cut。
       const needTick =
         this.lodDirty ||
         this.lodTreeDirty ||
         (this.lodIncremental &&
           this.lodTickMs > 0 &&
-          !(this.lastLodTick?.settled ?? false));
+          (!(this.lastLodTick?.settled ?? false) || this.lodCutStale));
       if (anyDirty) {
         this.lodPoseDirtyAt = frameNow;
         this.lastLod = {
@@ -1453,24 +1466,6 @@ export class SparkRenderer extends THREE.Mesh {
         this.lodSettleMs = null;
       }
       this.lodTreeDirty = false;
-
-      // 節流期間留下來的那份索引,這一幀到期就套;連帶把它的 chunks 併成「螢幕上顯示的」
-      if (
-        this.lodPendingIndices &&
-        this.lodPendingUuidToMesh &&
-        frameNow - this.lodLastApplyAt >= this.lodApplyIntervalMs
-      ) {
-        this.updateLodIndices(
-          this.lodPendingUuidToMesh,
-          this.lodPendingIndices,
-        );
-        this.lodLastApplyAt = frameNow;
-        this.lodPendingIndices = null;
-        this.lodPendingUuidToMesh = null;
-        this.lodAppliedChunks = this.lodPendingChunks ?? this.lodAppliedChunks;
-        this.lodPendingChunks = null;
-        this.setDirty();
-      }
 
       if (needTick) {
         const tick = await this.updateLodInstances(
@@ -1611,7 +1606,19 @@ export class SparkRenderer extends THREE.Mesh {
       >,
     );
 
+    // D22 節流契約:原子一律 pack;增量只在 `lodApplyIntervalMs` 到期時才叫 worker pack
+    // (`packNow`),其餘 tick 只拆收、只回 `chunks` 與讀數。以前是 worker 每個有變動的 tick 都
+    // pack 整份索引、JS 再把節流期間多餘的那幾份暫存後丟掉——10M 的 cut 一次 pack 20+ms wasm,
+    // 每 50ms 只有一份會被上傳,其餘全是白做的,而且它們搶的是 tick 本身的時間。
+    const atomic = !opts.incremental || opts.budgetMs <= 0;
     const traverseStart = performance.now();
+    // 已 settled 卻仍 stale(上一個 tick 節流中、剛好收斂):不等間隔,立刻 pack——之後不會再有
+    // 變動,等只是把最後一份延後、還多花一個掃描 tick。
+    const packNow =
+      atomic ||
+      this.lodApplyIntervalMs <= 0 ||
+      traverseStart - this.lodLastApplyAt >= this.lodApplyIntervalMs ||
+      ((this.lastLodTick?.settled ?? false) && this.lodCutStale);
     const result = (await worker.call("traverseLodTrees", {
       maxSplats,
       pixelScaleLimit,
@@ -1620,19 +1627,21 @@ export class SparkRenderer extends THREE.Mesh {
       budgetMs: opts.budgetMs,
       incremental: opts.incremental,
       hysteresis: opts.hysteresis,
+      packNow,
     })) as {
       keyIndices: Record<
         string,
         { lodId: number; numSplats: number; indices: Uint32Array }
       > | null;
       chunks: [number, number][];
+      needsPack: boolean;
       pixelLimit?: number;
       neededChunks: number;
       done: boolean;
       tick?: LodTickStats;
     };
     this.lastTraverseTime = performance.now() - traverseStart;
-    const { keyIndices, chunks, pixelLimit, neededChunks } = result;
+    const { keyIndices, chunks, needsPack, pixelLimit, neededChunks } = result;
     this.lastPixelLimit = pixelLimit;
     const totalLodSplats = keyIndices
       ? Object.values(keyIndices).reduce(
@@ -1644,28 +1653,16 @@ export class SparkRenderer extends THREE.Mesh {
     //   `traverseLodTrees in ${this.lastTraverseTime} ms, pixelLimit=${pixelLimit}, totalLodSplats=${totalLodSplats}`,
     // );
 
-    // GPU 套用:原子一律立刻套;增量依 lodApplyIntervalMs 節流,節流期間只留最新一份。
-    // lodAppliedChunks/lodPendingChunks 跟著同一份決定走,讓 fetchPriority 知道「螢幕上
-    // 顯示的到底是哪份 cut 的 chunks」(C1,見 fetchPriority 段的不變式註解)。
+    // GPU 套用:索引回來了就是要套的(worker 只在 `packNow` 時 pack,見上),立刻套、把它的
+    // chunks 記成「螢幕上顯示的」。`lodLastApplyAt` 記的是 `packNow` 判定的那個時間點,兩次
+    // 套用的間隔才真的 ≈ lodApplyIntervalMs(記套用當下會多算進一次 tick 的時長)。
+    // 沒回索引(節流中,或 cut 根本沒變)時 `lodLastApplyAt` 不動——下一個 tick 若到期就會 pack。
     if (keyIndices) {
-      const now = performance.now();
-      if (
-        !opts.incremental ||
-        opts.budgetMs <= 0 ||
-        now - this.lodLastApplyAt >= this.lodApplyIntervalMs
-      ) {
-        this.updateLodIndices(uuidToMesh, keyIndices);
-        this.lodLastApplyAt = now;
-        this.lodPendingIndices = null;
-        this.lodPendingUuidToMesh = null;
-        this.lodAppliedChunks = chunks;
-        this.lodPendingChunks = null;
-      } else {
-        this.lodPendingIndices = keyIndices;
-        this.lodPendingUuidToMesh = uuidToMesh;
-        this.lodPendingChunks = chunks;
-      }
+      this.updateLodIndices(uuidToMesh, keyIndices);
+      this.lodLastApplyAt = traverseStart;
+      this.lodAppliedChunks = chunks;
     }
+    this.lodCutStale = needsPack;
     // console.log("chunks.length =", chunks.length);
 
     if (this.pager) {
@@ -1698,17 +1695,16 @@ export class SparkRenderer extends THREE.Mesh {
         chunk: 0,
       }));
 
-      // 不變式(spec §4.5 / C1):pager 不能釋放**螢幕上那份 cut** 用到的頁。節流期間
-      // (`lodPendingIndices` 還沒套進 GPU)畫面上顯示的仍是 `lodAppliedChunks` 那份,不是
-      // 這次 tick 剛回來的 `chunks`——`chunks` 是「最新表」的 refcount 投影,expand/collapse
-      // 可能已經讓螢幕上那份用到的某個 chunk 的 refcount 歸零、被它濾掉;若只信 `chunks`,
-      // pager(滿載時)可能在節流的那 ~lodApplyIntervalMs 內把那頁釋放掉,套用前螢幕已經
-      // 顯示別的 splat。所以節流中 = 螢幕上那份(`lodAppliedChunks`,排最前面優先保留)+
-      // 最新 tick 的 `chunks`;沒有節流(套用立即發生,`lodPendingIndices` 已清空)時
-      // `chunks` 本身就是 needed + wanted(增量)或 touched(原子)的完整清單,不用合併。
-      // 螢幕上的表只在表本身變動時才變,而表變動一定產生新的一份 pending pack、連帶換掉
-      // lodPendingChunks,所以同一 tick 的 chunks 足夠代表下一次「螢幕上」的候選。
-      const lists = this.lodPendingIndices
+      // 不變式(spec §4.5 / C1):pager 不能釋放**螢幕上那份 cut** 用到的頁。兩次套用之間
+      // worker 仍在拆收(D22:節流期間 worker 不 pack、但 cut 照樣在變),畫面上顯示的仍是
+      // `lodAppliedChunks` 那份,不是這次 tick 剛回來的 `chunks`——`chunks` 是「最新表」的
+      // refcount 投影,expand/collapse 可能已經讓螢幕上那份用到的某個 chunk 的 refcount 歸零、
+      // 被它濾掉;若只信 `chunks`,pager(滿載時)可能在下一次套用之前把那頁釋放掉,螢幕已經
+      // 顯示別的 splat。判準是 worker 回報的 `needsPack`(`lodCutStale`):true = cut 已與
+      // 螢幕上那份不同 → 螢幕上那份(`lodAppliedChunks`,排最前面優先保留)+ 最新 tick 的
+      // `chunks`;false(剛 pack 過並套用,或 cut 沒變)時 `chunks` 本身就是 needed + wanted
+      // (增量)或 touched(原子)的完整清單,不用合併。
+      const lists = this.lodCutStale
         ? [this.lodAppliedChunks, chunks]
         : [chunks];
       const seen = new Set<number>();

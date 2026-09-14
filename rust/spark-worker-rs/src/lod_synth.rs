@@ -374,6 +374,101 @@ pub(crate) fn walk_main(rounds: usize, eps: f32, diag: bool) {
     );
 }
 
+/// 「填滿」模擬(D22,2026-09-14 手測 `lodSplatScaleWalk` 4 的重現):同一個姿態(POSES[0])
+/// 先在 2.5M 預算 settle,再把 `max_splats` 直接拉到 10M、姿態不動,數 tick(20ms 預算、真
+/// deadline:掃描 12ms / 全部 20ms,跟 `walk_main` 同一組)直到 `cut_size ≥ 0.98·目標`(目標 =
+/// min(10M, 該姿態原子 10M 的 cut 大小 —— 若門檻先到、原子也填不到 10M))或 settled。
+/// 印 tick 數與 wasm 總毫秒;同一輪先量原子 10M 一次到底要幾毫秒,當作比較基準(目標:增量
+/// 填滿 ≤ 2× 原子)。D22 之前:每 tick 掃描先吃 60% 預算才輪到拆、每個有變動的 tick 都白 pack
+/// 整份 10M 索引(JS 每 50ms 才上傳一次),填滿要分鐘級;之後:有積壓就跳過掃描、pack 只在
+/// 呼叫端要上傳時做。`pack_every` 模擬 JS 的 `lodApplyIntervalMs`:每隔幾個 tick pack 一次
+/// (0 = 每 tick pack,D22 之前的行為)。
+#[allow(dead_code)]
+// `u32::is_multiple_of` 是 1.87 才穩定,workspace 的 rust-version 是 1.82(同 lod_cut.rs 的兩處)。
+#[allow(clippy::manual_is_multiple_of)]
+pub(crate) fn fill_main(rounds: usize, eps: f32, pack_every: usize) {
+    use crate::lod_cut::IncrementalCut;
+    use std::time::Instant;
+    const SETTLE_TICK_CAP: u32 = 400;
+    const FILL_TICK_CAP: u32 = 20_000;
+    let base = 2_500_000usize;
+    let target_max = 10_000_000usize;
+    let tree = build_synth(7, 256 * CHUNK, 256.0);
+    let (splats, c2p, root_page) = page_out(&tree);
+    let limit = PIXEL_SCALE_LIMIT;
+    let p = params(POSES[0].0, POSES[0].1);
+    let trees = [TreeView { lod_id: 1, splats: &splats, chunk_to_page: &c2p, params: p }];
+    eprintln!("FILL PARAMS: eps={eps} pack_every={pack_every} base={base} target_max={target_max}");
+    let mut best_atomic = f64::INFINITY;
+    let mut atomic_n = 0usize;
+    let mut best_fill: Option<(u32, f64, f64, usize)> = None;
+    for round in 0..rounds {
+        let t = Instant::now();
+        let (_, n10) = run_atomic(&splats, &c2p, root_page, p, target_max);
+        let atomic_ms = t.elapsed().as_secs_f64() * 1e3;
+        best_atomic = best_atomic.min(atomic_ms);
+        atomic_n = n10;
+        let goal = (0.98 * target_max.min(n10) as f64) as usize;
+
+        let mut cut = IncrementalCut::new();
+        let tick_once = |cut: &mut IncrementalCut, max: usize, k: u32| -> (crate::lod_cut::TickStats, f64, f64) {
+            let t = Instant::now();
+            let scan_at = t + std::time::Duration::from_millis(12);
+            let deadline_at = t + std::time::Duration::from_millis(20);
+            let st = cut.tick(&trees, &[root_page], max, limit, eps, &mut || Instant::now() >= scan_at, &mut || Instant::now() >= deadline_at);
+            let tick_ms = t.elapsed().as_secs_f64() * 1e3;
+            let t2 = Instant::now();
+            let want_pack = pack_every == 0 || k % pack_every as u32 == 0;
+            if want_pack && cut.needs_pack() {
+                let _ = cut.pack(&trees);
+            }
+            (st, tick_ms, t2.elapsed().as_secs_f64() * 1e3)
+        };
+        // 1. 2.5M settle(冷啟動,不計)
+        let mut k = 0u32;
+        loop {
+            k += 1;
+            let (st, _, _) = tick_once(&mut cut, base, k);
+            if st.settled || k >= SETTLE_TICK_CAP { break; }
+        }
+        let settled_n = cut.cut_size;
+        // 2. 同姿態、max → 10M,數到 0.98·goal 或 settled
+        let mut ticks = 0u32;
+        let mut sum_tick = 0.0;
+        let mut sum_pack = 0.0;
+        let wall = Instant::now();
+        let reason;
+        loop {
+            ticks += 1;
+            let (st, tick_ms, pack_ms) = tick_once(&mut cut, target_max, ticks);
+            sum_tick += tick_ms;
+            sum_pack += pack_ms;
+            if ticks <= 3 || ticks % 50 == 0 {
+                eprintln!("fill tick {ticks}: tick {tick_ms:6.1} ms pack {pack_ms:5.1} ms  cut {}  scan {} exp {} col {} t {:.3e} settled {}",
+                    st.cut_size, st.scanned, st.expanded, st.collapsed, st.t, st.settled);
+            }
+            if cut.cut_size >= goal { reason = "reached"; break; }
+            if st.settled { reason = "settled"; break; }
+            if ticks >= FILL_TICK_CAP { reason = "cap"; break; }
+        }
+        let wall_ms = wall.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "round {round}: atomic10M {atomic_ms:.1} ms (cut {n10}) | settled@2.5M cut {settled_n} in {k} ticks | FILL {ticks} ticks ({reason}) tick-sum {sum_tick:.1} ms pack-sum {sum_pack:.1} ms wall {wall_ms:.1} ms cut {} goal {goal}",
+            cut.cut_size
+        );
+        assert!(cut.cut_size >= goal, "填不到 0.98×目標:cut {} goal {goal}({reason})", cut.cut_size);
+        if best_fill.is_none_or(|b| sum_tick + sum_pack < b.1 + b.2) {
+            best_fill = Some((ticks, sum_tick, sum_pack, cut.cut_size));
+        }
+    }
+    let (ticks, sum_tick, sum_pack, n) = best_fill.unwrap();
+    let total = sum_tick + sum_pack;
+    eprintln!(
+        "FILL MIN of {rounds}: {ticks} ticks, tick {sum_tick:.1} + pack {sum_pack:.1} = {total:.1} ms (cut {n}) | atomic 10M {best_atomic:.1} ms (cut {atomic_n}) | ratio {:.2}x",
+        total / best_atomic
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

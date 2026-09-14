@@ -742,6 +742,13 @@ export type LodTickStats = {
   changed: boolean;
   tickMs: number;
   boundSkipped: number;
+  /** D22:這次呼叫有沒有交出 `instanceIndices`(= `packNow && needs_pack()`)。 */
+  packed: boolean;
+  /**
+   * D22:這次呼叫**之後** cut 是否仍與上一次交出去的 pack 不同(剛 pack 過 → false)。
+   * true = 螢幕上那份已過期,`fetchPriority` 要連它用到的 chunks 一起保住(不變式 2)。
+   */
+  needsPack: boolean;
 };
 
 function traverseLodTrees({
@@ -752,6 +759,7 @@ function traverseLodTrees({
   budgetMs = 0,
   incremental = false,
   hysteresis = 0,
+  packNow = true,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
@@ -776,6 +784,12 @@ function traverseLodTrees({
   incremental?: boolean;
   /** 拆 / 收的遲滯 ε(0..1)。 */
   hysteresis?: number;
+  /**
+   * D22:增量路徑只在 true 時才 pack `instanceIndices`(且 cut 真的變了),false 回 `null`;
+   * `chunks` / `tick` 照回。呼叫端在「這次會套進 GPU」(`lodApplyIntervalMs` 到期)時才給 true,
+   * 節流期間的 pack 是白做的(10M cut 一次 20+ms)。原子路徑忽略(永遠 pack)。
+   */
+  packNow?: boolean;
 }) {
   const keyInstances = Object.entries(instances);
   const lodIds = new Uint32Array(
@@ -823,6 +837,7 @@ function traverseLodTrees({
     budgetMs,
     incremental,
     hysteresis,
+    packNow,
   ) as {
     instanceIndices:
       | {
@@ -832,14 +847,22 @@ function traverseLodTrees({
         }[]
       | null;
     chunks: [number, number][];
+    needsPack: boolean;
     pixelLimit?: number;
     neededChunks: number;
     done: boolean;
     tick?: LodTickStats;
     tickMs?: number;
   };
-  const { instanceIndices, chunks, pixelLimit, neededChunks, done, tick } =
-    result;
+  const {
+    instanceIndices,
+    chunks,
+    needsPack,
+    pixelLimit,
+    neededChunks,
+    done,
+    tick,
+  } = result;
 
   const keyIndices =
     instanceIndices === null
@@ -859,6 +882,7 @@ function traverseLodTrees({
   return {
     keyIndices,
     chunks,
+    needsPack,
     pixelLimit,
     neededChunks,
     done,

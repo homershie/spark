@@ -729,6 +729,8 @@ impl IncrementalCut {
 
     /// 一次 worker 呼叫的工作(spec §4.2)。掃描階段跑到 `scan_deadline`(預算的 60%,免得掃描把
     /// 時間吃光、拆收永遠輪不到),其餘階段跑到 `deadline`;任一回 true 就停,狀態永遠合法。
+    /// D22:進來時 `expand_heap` / `collapse_heap` 有積壓(上一 tick 拆收被 deadline 打斷)就
+    /// **整個跳過掃描**,把全部預算交給拆收——見掃描段的註解。
     /// 介面由 spec §4.8 / task brief 指定,參數不可減——同 `lod_tree.rs` 的 `traverse_lod_trees` 先例。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn tick(
@@ -787,7 +789,19 @@ impl IncrementalCut {
         let n = self.nodes.len();
         let mut checks = 0u32;
         let mut stopped = false;
-        for _ in 0..n {
+        // D22:有積壓就跳過掃描。heap 非空只有一種來路——上一個 tick 拆/收到一半被 deadline 打斷
+        // (消費端的其他出口都會把 heap 清空:過門檻 → `clear_*_heap`、misfit → clear、pop 光 → 空;
+        // params/max/limit 變了則在上面已經清掉)。那批候選是已知的、按 ps 排好的工作,再掃一次
+        // 只會(a)把 60% 的預算花在「重新確認同一批候選」上、(b)推進更多候選讓 heap 更長,
+        // 拆收永遠只拿到剩下的 40%。手測 `lodSplatScaleWalk` 4(預算 2.5M → 10M)因此每 tick
+        // 只拆 ~4k、填滿要分鐘級。跳過掃描 = 整個 tick 交給拆收;`visited_since_change` 不前進
+        // (正確:有積壓本來就不算 settled,`settled()` 要求兩個 heap 都空),`cursor` 不動,
+        // D21 直方圖也不動(它只在「窗掃完 + heap 空」時被讀,而這個 tick 兩者都不成立;若這個
+        // tick 拆/收成功,tick 尾端照樣 `reset_scan_window()`)。姿態每幀在變的走路階段不受影響
+        // ——params 變了 heap 就清空,掃描照舊每 tick 跑。
+        let backlog = !self.expand_heap.is_empty() || !self.collapse_heap.is_empty();
+        let scan_count = if backlog { 0 } else { n };
+        for _ in 0..scan_count {
             // C1:deadline 檢查移到讀 / 前進 cursor 之前 —— 一旦這裡中斷,這個 slot 還沒被讀取,
             // cursor 也還沒往前、`visited_since_change` 也還沒 +1(不能算「訪問過」)。原本的順序
             // 是讀完、前進完、算完訪問數才查 deadline,中斷點會把「還沒真的掃到的那個 slot」算成
@@ -1620,6 +1634,48 @@ mod tests {
         }
         assert!(!settled_early, "前 5 tick 內就 settled,量不到冷啟動累積階段,測試沒有覆蓋到目標場景");
         assert!(ticks > 5, "應該要很多 tick 才 settled(才有機會觀察到 heap 是否累積):{ticks}");
+    }
+
+    /// D22 回歸測試:進 tick 時 `expand_heap` 已有積壓 → 這個 tick 不掃描,預算全部給拆。
+    ///
+    /// 用 `deadline_stride = 1` + 兩個閉包共用一個 Cell 計數(第 N+1 次呼叫才喊停)把「一個 tick
+    /// 的預算」量化成 N 次 deadline 查詢。tick 1 先製造積壓:掃描不限、拆第一次查就停 → 只拆 1 筆,
+    /// 剩下的候選留在 heap。tick 2 給 N=3:修之前掃描先把查詢吃掉(每掃一個 slot 查一次,
+    /// nodes.len()=2 → 吃掉 2 次)、拆只拿到剩下的 → `scanned == 2`、`expanded == 2`;修之後掃描
+    /// 整段跳過,拆拿到全部 N+1 筆(`tick()` 的結構是「先做 1 筆才查」,所以是 N+1)→
+    /// `scanned == 0`、`expanded == 4`。RED(修前 2/2)/ GREEN(修後 0/4)兩邊都跑過。
+    /// 順帶釘住:積壓中不算 settled。
+    #[test]
+    fn inc_backlog_skips_scan_and_spends_budget_on_expansion() {
+        let (splats, parent) = build_tree();
+        let c2p = [0u32];
+        let limit = 0.001; // 全部節點都在門檻之上,候選只受 deadline 限制
+        let p = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let trees = views_p(&splats, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], limit);
+        cut.deadline_stride = 1;
+        // tick 1:掃描不限(把 root 的 4 個孩子排進 heap)、拆第一次查就停 → 拆 1 筆,heap 留 3 + 新孩子 4。
+        let st1 = cut.tick(&trees, &[0], 1000, limit, 0.0, &mut || false, &mut || true);
+        assert_eq!(st1.expanded, 1, "tick 1 應該只拆 1 筆(第一次查 deadline 就停)");
+        let (exp_len, _) = cut.heap_lens_for_test();
+        assert!(exp_len >= 4, "tick 1 之後 expand_heap 應有積壓:{exp_len}");
+        assert_valid(&cut, &parent);
+        // tick 2:N = 3 次查詢的預算,兩個閉包共用。
+        let n = std::cell::Cell::new(0u32);
+        let stop = || { n.set(n.get() + 1); n.get() > 3 };
+        let st2 = cut.tick(&trees, &[0], 1000, limit, 0.0, &mut || stop(), &mut || stop());
+        assert_valid(&cut, &parent);
+        assert_eq!(
+            st2.expanded, 4,
+            "有積壓的 tick 應該把整個預算(N+1 = 4 筆)用在拆上;修 D22 之前掃描先吃掉查詢、拆只剩 2 筆"
+        );
+        assert_eq!(st2.scanned, 0, "有積壓的 tick 不該掃描");
+        assert!(!st2.settled, "還有積壓,不算 settled");
+        // 收尾:不限 deadline 跑到 settled,結果仍等於原子。
+        settle(&mut cut, &trees, 1000, limit, 0.0);
+        assert_valid(&cut, &parent);
+        assert_eq!(cut_indices(&cut), atomic_cut(&splats, &p, limit, 1000));
     }
 
     /// 遲滯:z=-100、limit 0.04 時 L1 的 ps ≈ 0.0399(貼著門檻)。先在 limit 0.03 建到 L2,

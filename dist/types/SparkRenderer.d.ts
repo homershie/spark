@@ -190,7 +190,10 @@ export interface SparkRendererOptions {
     lodTickMs?: number;
     /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
     lodHysteresis?: number;
-    /** 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。 */
+    /**
+     * 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。D22:到期前的 tick 連 worker 端的
+     * pack 都省掉(`packNow=false`),不只是延後上傳。
+     */
     lodApplyIntervalMs?: number;
     /**
      * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
@@ -377,7 +380,10 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodTickMs: number;
     /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
     lodHysteresis: number;
-    /** 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。 */
+    /**
+     * 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。D22:到期前的 tick 連 worker 端的
+     * pack 都省掉(`packNow=false`),不只是延後上傳。
+     */
     lodApplyIntervalMs: number;
     /** 最近一次 tick 的讀數;null = 還沒 tick 過。 */
     lastLodTick: (LodTickStats & {
@@ -390,15 +396,23 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodSettleMs: number | null;
     /** 最近一次姿態變髒的 performance.now();用於量測 lodSettleMs。 */
     private lodPoseDirtyAt;
-    /** 上一次把 lodPendingIndices 套進 GPU 的 performance.now()(節流用)。 */
+    /**
+     * 上一次「要 worker pack、並把回來的索引套進 GPU」的 performance.now()(節流用)。
+     * D22 的契約:節流不再是「worker 每次都 pack、JS 把多餘的暫存」,而是**JS 到期才叫 worker
+     * pack**(`packNow`),回來的索引一律立刻套——沒有 pending 這一層了。
+     */
     private lodLastApplyAt;
-    /** 被節流延後、還沒套進 GPU 的最新一份索引;下次到期的幀套用。 */
-    private lodPendingIndices;
-    private lodPendingUuidToMesh;
-    /** 目前**螢幕上顯示**那份 cut 帶的 chunks(不是最新 tick 的 —— 節流期間兩者可能不同)。 */
+    /**
+     * 目前**螢幕上顯示**那份 cut 帶的 chunks。兩次套用之間 worker 仍在拆收,最新 tick 的 `chunks`
+     * 是「最新表」的投影,可能已經不含螢幕上那份用到的某個 chunk;`lodCutStale` 為 true 時
+     * fetchPriority 得把這份排最前面保住(spec §4.5 不變式 2)。
+     */
     private lodAppliedChunks;
-    /** 被節流延後、還沒套進 GPU 那份索引所帶的 chunks;套用時併入 lodAppliedChunks。 */
-    private lodPendingChunks;
+    /**
+     * D22:最近一次 tick 回報的 `needsPack`——true = cut 已經跟螢幕上那份(上一次交出去的 pack)
+     * 不同、還沒重 pack。原子路徑恆 false。
+     */
+    private lodCutStale;
     /** 頁面更新到了,會讓下面的 needTick 在這一幀強制 tick 一次(不等 settled);見 driveLod。 */
     lodTreeDirty: boolean;
     lodInflate: boolean;
