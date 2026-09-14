@@ -9863,6 +9863,8 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.lodLastApplyAt = 0;
     this.lodPendingIndices = null;
     this.lodPendingUuidToMesh = null;
+    this.lodAppliedChunks = [];
+    this.lodPendingChunks = null;
     this.lodTreeDirty = false;
     this.lastLodRaycastTime = 0;
     this.lodWorker = null;
@@ -10572,31 +10574,33 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         await worker.call("updateLodTrees", { ranges: lodUpdates });
         this.lodTreeDirty = true;
       }
-      const roundNow = performance.now();
-      const poseDirty = this.lodDirty;
-      const needTick = this.lodDirty || this.lodTreeDirty || this.lodIncremental && !(((_a3 = this.lastLodTick) == null ? void 0 : _a3.settled) ?? false);
-      if (poseDirty) this.lodPoseDirtyAt = roundNow;
-      if (this.lodDirty) {
+      const frameNow = performance.now();
+      const anyDirty = this.lodDirty;
+      const needTick = this.lodDirty || this.lodTreeDirty || this.lodIncremental && this.lodTickMs > 0 && !(((_a3 = this.lastLodTick) == null ? void 0 : _a3.settled) ?? false);
+      if (anyDirty) {
+        this.lodPoseDirtyAt = frameNow;
         this.lastLod = {
           pos: viewPos,
           quat: viewQuat,
           pixelScaleLimit,
           maxSplats,
-          timestamp: roundNow
+          timestamp: frameNow
         };
         this.lodDirty = false;
         this.lodDirtyOwned = false;
         this.lodSettleMs = null;
       }
       this.lodTreeDirty = false;
-      if (this.lodPendingIndices && this.lodPendingUuidToMesh && roundNow - this.lodLastApplyAt >= this.lodApplyIntervalMs) {
+      if (this.lodPendingIndices && this.lodPendingUuidToMesh && frameNow - this.lodLastApplyAt >= this.lodApplyIntervalMs) {
         this.updateLodIndices(
           this.lodPendingUuidToMesh,
           this.lodPendingIndices
         );
-        this.lodLastApplyAt = roundNow;
+        this.lodLastApplyAt = frameNow;
         this.lodPendingIndices = null;
         this.lodPendingUuidToMesh = null;
+        this.lodAppliedChunks = this.lodPendingChunks ?? this.lodAppliedChunks;
+        this.lodPendingChunks = null;
         this.setDirty();
       }
       if (needTick) {
@@ -10714,9 +10718,12 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         this.lodLastApplyAt = now;
         this.lodPendingIndices = null;
         this.lodPendingUuidToMesh = null;
+        this.lodAppliedChunks = chunks;
+        this.lodPendingChunks = null;
       } else {
         this.lodPendingIndices = keyIndices;
         this.lodPendingUuidToMesh = uuidToMesh;
+        this.lodPendingChunks = chunks;
       }
     }
     if (this.pager) {
@@ -10742,10 +10749,17 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         splats,
         chunk: 0
       }));
-      for (const [lodId, chunk] of chunks) {
-        const splats = this.lodIdToSplats.get(lodId);
-        if (splats instanceof PagedSplats && chunk !== 0) {
-          this.pager.fetchPriority.push({ splats, chunk });
+      const lists = this.lodPendingIndices ? [this.lodAppliedChunks, chunks] : [chunks];
+      const seen = /* @__PURE__ */ new Set();
+      for (const list of lists) {
+        for (const [lodId, chunk] of list) {
+          const key = lodId * 2 ** 20 + chunk;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const splats = this.lodIdToSplats.get(lodId);
+          if (splats instanceof PagedSplats && chunk !== 0) {
+            this.pager.fetchPriority.push({ splats, chunk });
+          }
         }
       }
       this.pager.autoDrive = this.enableLodFetching;

@@ -212,7 +212,10 @@ export interface SparkRendererOptions {
    * @default true
    */
   lodIncremental?: boolean;
-  /** 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。 */
+  /**
+   * 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。
+   * ≤ 0 = 每次髒了從 root 原子重走(等同 lodIncremental=false)。
+   */
   lodTickMs?: number;
   /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
   lodHysteresis?: number;
@@ -406,7 +409,10 @@ export class SparkRenderer extends THREE.Mesh {
    * 變動從 root 原子重走(v2.1.0 行為,A/B 對照)。
    */
   lodIncremental: boolean;
-  /** 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。 */
+  /**
+   * 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。
+   * ≤ 0 = 每次髒了從 root 原子重走(等同 lodIncremental=false)。
+   */
   lodTickMs: number;
   /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
   lodHysteresis: number;
@@ -430,7 +436,11 @@ export class SparkRenderer extends THREE.Mesh {
     { lodId: number; numSplats: number; indices: Uint32Array }
   > | null = null;
   private lodPendingUuidToMesh: Map<string, SplatMesh> | null = null;
-  /** 頁面更新到了、但要等這次 tick settled 再補一次;見 driveLod。 */
+  /** 目前**螢幕上顯示**那份 cut 帶的 chunks(不是最新 tick 的 —— 節流期間兩者可能不同)。 */
+  private lodAppliedChunks: [number, number][] = [];
+  /** 被節流延後、還沒套進 GPU 那份索引所帶的 chunks;套用時併入 lodAppliedChunks。 */
+  private lodPendingChunks: [number, number][] | null = null;
+  /** 頁面更新到了,會讓下面的 needTick 在這一幀強制 tick 一次(不等 settled);見 driveLod。 */
   lodTreeDirty = false;
   lodInflate: boolean;
   pagedExtSplats: boolean;
@@ -1421,20 +1431,22 @@ export class SparkRenderer extends THREE.Mesh {
       }
 
       // ── 方案 B:髒了、或 cut 還沒 settled,就 tick 一次(spec §5.2)──
-      const roundNow = performance.now();
-      const poseDirty = this.lodDirty;
+      const frameNow = performance.now();
+      const anyDirty = this.lodDirty;
       const needTick =
         this.lodDirty ||
         this.lodTreeDirty ||
-        (this.lodIncremental && !(this.lastLodTick?.settled ?? false));
-      if (poseDirty) this.lodPoseDirtyAt = roundNow;
-      if (this.lodDirty) {
+        (this.lodIncremental &&
+          this.lodTickMs > 0 &&
+          !(this.lastLodTick?.settled ?? false));
+      if (anyDirty) {
+        this.lodPoseDirtyAt = frameNow;
         this.lastLod = {
           pos: viewPos,
           quat: viewQuat,
           pixelScaleLimit,
           maxSplats,
-          timestamp: roundNow,
+          timestamp: frameNow,
         };
         this.lodDirty = false;
         this.lodDirtyOwned = false;
@@ -1442,19 +1454,21 @@ export class SparkRenderer extends THREE.Mesh {
       }
       this.lodTreeDirty = false;
 
-      // 節流期間留下來的那份索引,這一幀到期就套
+      // 節流期間留下來的那份索引,這一幀到期就套;連帶把它的 chunks 併成「螢幕上顯示的」
       if (
         this.lodPendingIndices &&
         this.lodPendingUuidToMesh &&
-        roundNow - this.lodLastApplyAt >= this.lodApplyIntervalMs
+        frameNow - this.lodLastApplyAt >= this.lodApplyIntervalMs
       ) {
         this.updateLodIndices(
           this.lodPendingUuidToMesh,
           this.lodPendingIndices,
         );
-        this.lodLastApplyAt = roundNow;
+        this.lodLastApplyAt = frameNow;
         this.lodPendingIndices = null;
         this.lodPendingUuidToMesh = null;
+        this.lodAppliedChunks = this.lodPendingChunks ?? this.lodAppliedChunks;
+        this.lodPendingChunks = null;
         this.setDirty();
       }
 
@@ -1630,7 +1644,9 @@ export class SparkRenderer extends THREE.Mesh {
     //   `traverseLodTrees in ${this.lastTraverseTime} ms, pixelLimit=${pixelLimit}, totalLodSplats=${totalLodSplats}`,
     // );
 
-    // GPU 套用:原子一律立刻套;增量依 lodApplyIntervalMs 節流,節流期間只留最新一份
+    // GPU 套用:原子一律立刻套;增量依 lodApplyIntervalMs 節流,節流期間只留最新一份。
+    // lodAppliedChunks/lodPendingChunks 跟著同一份決定走,讓 fetchPriority 知道「螢幕上
+    // 顯示的到底是哪份 cut 的 chunks」(C1,見 fetchPriority 段的不變式註解)。
     if (keyIndices) {
       const now = performance.now();
       if (
@@ -1642,9 +1658,12 @@ export class SparkRenderer extends THREE.Mesh {
         this.lodLastApplyAt = now;
         this.lodPendingIndices = null;
         this.lodPendingUuidToMesh = null;
+        this.lodAppliedChunks = chunks;
+        this.lodPendingChunks = null;
       } else {
         this.lodPendingIndices = keyIndices;
         this.lodPendingUuidToMesh = uuidToMesh;
+        this.lodPendingChunks = chunks;
       }
     }
     // console.log("chunks.length =", chunks.length);
@@ -1679,13 +1698,29 @@ export class SparkRenderer extends THREE.Mesh {
         chunk: 0,
       }));
 
-      // 不變式(spec §4.5):pager 不能釋放**螢幕上那份 cut** 用到的頁。增量路徑的 `chunks`
-      // 本身就是 needed + wanted 的完整清單(roots 之外的全部);原子路徑的 `chunks` = touched,
-      // 語意同今天。不用再跟上一份套用的 chunks 合併。
-      for (const [lodId, chunk] of chunks) {
-        const splats = this.lodIdToSplats.get(lodId);
-        if (splats instanceof PagedSplats && chunk !== 0) {
-          this.pager.fetchPriority.push({ splats, chunk });
+      // 不變式(spec §4.5 / C1):pager 不能釋放**螢幕上那份 cut** 用到的頁。節流期間
+      // (`lodPendingIndices` 還沒套進 GPU)畫面上顯示的仍是 `lodAppliedChunks` 那份,不是
+      // 這次 tick 剛回來的 `chunks`——`chunks` 是「最新表」的 refcount 投影,expand/collapse
+      // 可能已經讓螢幕上那份用到的某個 chunk 的 refcount 歸零、被它濾掉;若只信 `chunks`,
+      // pager(滿載時)可能在節流的那 ~lodApplyIntervalMs 內把那頁釋放掉,套用前螢幕已經
+      // 顯示別的 splat。所以節流中 = 螢幕上那份(`lodAppliedChunks`,排最前面優先保留)+
+      // 最新 tick 的 `chunks`;沒有節流(套用立即發生,`lodPendingIndices` 已清空)時
+      // `chunks` 本身就是 needed + wanted(增量)或 touched(原子)的完整清單,不用合併。
+      // 螢幕上的表只在表本身變動時才變,而表變動一定產生新的一份 pending pack、連帶換掉
+      // lodPendingChunks,所以同一 tick 的 chunks 足夠代表下一次「螢幕上」的候選。
+      const lists = this.lodPendingIndices
+        ? [this.lodAppliedChunks, chunks]
+        : [chunks];
+      const seen = new Set<number>();
+      for (const list of lists) {
+        for (const [lodId, chunk] of list) {
+          const key = lodId * 2 ** 20 + chunk;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const splats = this.lodIdToSplats.get(lodId);
+          if (splats instanceof PagedSplats && chunk !== 0) {
+            this.pager.fetchPriority.push({ splats, chunk });
+          }
         }
       }
 

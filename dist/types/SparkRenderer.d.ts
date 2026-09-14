@@ -183,7 +183,10 @@ export interface SparkRendererOptions {
      * @default true
      */
     lodIncremental?: boolean;
-    /** 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。 */
+    /**
+     * 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。
+     * ≤ 0 = 每次髒了從 root 原子重走(等同 lodIncremental=false)。
+     */
     lodTickMs?: number;
     /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
     lodHysteresis?: number;
@@ -367,7 +370,10 @@ export declare class SparkRenderer extends THREE.Mesh {
      * 變動從 root 原子重走(v2.1.0 行為,A/B 對照)。
      */
     lodIncremental: boolean;
-    /** 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。 */
+    /**
+     * 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。
+     * ≤ 0 = 每次髒了從 root 原子重走(等同 lodIncremental=false)。
+     */
     lodTickMs: number;
     /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
     lodHysteresis: number;
@@ -389,7 +395,11 @@ export declare class SparkRenderer extends THREE.Mesh {
     /** 被節流延後、還沒套進 GPU 的最新一份索引;下次到期的幀套用。 */
     private lodPendingIndices;
     private lodPendingUuidToMesh;
-    /** 頁面更新到了、但要等這次 tick settled 再補一次;見 driveLod。 */
+    /** 目前**螢幕上顯示**那份 cut 帶的 chunks(不是最新 tick 的 —— 節流期間兩者可能不同)。 */
+    private lodAppliedChunks;
+    /** 被節流延後、還沒套進 GPU 那份索引所帶的 chunks;套用時併入 lodAppliedChunks。 */
+    private lodPendingChunks;
+    /** 頁面更新到了,會讓下面的 needTick 在這一幀強制 tick 一次(不等 settled);見 driveLod。 */
     lodTreeDirty: boolean;
     lodInflate: boolean;
     pagedExtSplats: boolean;
