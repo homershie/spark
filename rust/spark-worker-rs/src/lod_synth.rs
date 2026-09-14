@@ -236,6 +236,73 @@ pub(crate) fn bench_main(rounds: usize) {
     );
 }
 
+/// 方案 B 的走路模擬:20 站、每站位移 0.05 單位 + 轉 1°,每站 tick(20ms 預算)到 settled。
+/// 印每 tick 的 ms(tick / pack 分開)、每站 settle 的 tick 數、拆收數。目標:tick ≤ 30ms、settle ≤ 6 tick。
+/// worker crate 的 test build 不呼叫它(只有 `traverse-bench` 用 `#[path]` include 後在 `main` 呼叫)。
+#[allow(dead_code)]
+pub(crate) fn walk_main(rounds: usize) {
+    use crate::lod_cut::IncrementalCut;
+    use std::time::Instant;
+    let tree = build_synth(7, 256 * CHUNK, 256.0);
+    let (splats, c2p, root_page) = page_out(&tree);
+    let mut cut = IncrementalCut::new();
+    let limit = PIXEL_SCALE_LIMIT;
+    let max = 2_500_000;
+    let mut origin = POSES[0].0;
+    let mut yaw = 0.0f32;
+    let mut all_tick = Vec::new();
+    let mut all_pack = Vec::new();
+    let mut settle_ticks = Vec::new();
+    // 最後一站實際用來 tick 的姿態(推進之前存起來,見 task brief 的提醒:
+    // 推進之後的 origin/yaw 不是最後一站 tick 時用的那個,Jaccard 會量錯東西)。
+    let mut last = (origin, yaw);
+    for station in 0..(20 * rounds) {
+        let forward = Vec3A::new(yaw.sin(), 0.0, yaw.cos());
+        let trees = [TreeView { lod_id: 1, splats: &splats, chunk_to_page: &c2p, params: params(origin, forward) }];
+        let mut ticks = 0;
+        loop {
+            let t = Instant::now();
+            let scan_at = t + std::time::Duration::from_millis(12);
+            let deadline_at = t + std::time::Duration::from_millis(20);
+            let st = cut.tick(&trees, &[root_page], max, limit, 0.15, &mut || Instant::now() >= scan_at, &mut || Instant::now() >= deadline_at);
+            let tick_ms = t.elapsed().as_secs_f64() * 1e3;
+            let t2 = Instant::now();
+            let packed = if cut.needs_pack() { Some(cut.pack(&trees)) } else { None };
+            let pack_ms = t2.elapsed().as_secs_f64() * 1e3;
+            all_tick.push(tick_ms);
+            if packed.is_some() { all_pack.push(pack_ms); }
+            ticks += 1;
+            if station < 2 || ticks <= 2 {
+                eprintln!("station {station} tick {ticks}: tick {tick_ms:6.1} ms pack {pack_ms:5.1} ms  cut {}  exp {} col {} t {:.3e} settled {}",
+                    st.cut_size, st.expanded, st.collapsed, st.t, st.settled);
+            }
+            if st.settled || ticks >= 60 { break; }
+        }
+        settle_ticks.push(ticks);
+        last = (origin, yaw);
+        origin += Vec3A::new(0.05 * yaw.cos(), 0.0, -0.05 * yaw.sin());
+        yaw += 1.0f32.to_radians();
+    }
+    let med = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+    let p90 = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[(v.len() as f64 * 0.9) as usize] };
+    settle_ticks.sort_unstable();
+    eprintln!("WALK: tick median {:.1} p90 {:.1} ms | pack median {:.1} ms | settle ticks median {} max {} | cut {}",
+        med(&mut all_tick.clone()), p90(&mut all_tick.clone()), med(&mut all_pack.clone()),
+        settle_ticks[settle_ticks.len() / 2], settle_ticks.last().unwrap(), cut.cut_size);
+    // 品質下限(spec §7.1 synth_inc_walk):最後一站的增量 cut 與原子 cut 的 Jaccard ≥ 0.97
+    let (last_origin, last_yaw) = last;
+    let forward = Vec3A::new(last_yaw.sin(), 0.0, last_yaw.cos());
+    let p_last = params(last_origin, forward);
+    let trees = [TreeView { lod_id: 1, splats: &splats, chunk_to_page: &c2p, params: p_last }];
+    let (atomic, _) = run_atomic(&splats, &c2p, root_page, p_last, max);
+    let inc: AHashSet<u32> = cut.pack(&trees).indices[0].iter().copied().collect();
+    let at: AHashSet<u32> = atomic.into_iter().collect();
+    let inter = inc.intersection(&at).count() as f64;
+    let j = inter / (inc.len() as f64 + at.len() as f64 - inter);
+    eprintln!("JACCARD vs atomic: {j:.3}  (inc {} atomic {})", inc.len(), at.len());
+    assert!(j >= 0.97, "增量 cut 與原子差太多:{j:.3}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
