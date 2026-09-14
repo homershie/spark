@@ -123,6 +123,14 @@ pub(crate) struct IncrementalCut {
     pub(crate) t: f32,
     pub(crate) generation: u64,
     packed_generation: u64,
+    /// pager 釋放了 cut 正在用的頁(`update_lod_trees` 的頁釋放分支),但沒有任何 expand/collapse
+    /// 發生 → `generation` 不變、`needs_pack()` 原本會誤判「沒變」,JS 繼續渲染指向舊 chunk 的
+    /// paged index,而那個槽位現在住著別的 chunk。這個旗標由 `note_chunk_released` 在「被釋放的
+    /// chunk 確實有 cut 的孩子住在裡面」時設 true,`needs_pack()` 把它跟
+    /// `packed_generation != generation` 做 OR;`pack()` 清掉、`restart()` 也清掉(新的一輪,舊的
+    /// 髒旗標沒有意義)。只在「cut 真的引用這個 chunk」時設,不是每次頁釋放都設——production
+    /// 串流時頁釋放很頻繁,場景全量的 repack 一次 ~17ms,設過寬會一秒內觸發好幾次。
+    tables_dirty: bool,
     cursor: usize,
     /// 上次 tick 的姿態 / 參數;變了就把「已訪問筆數」歸零(settled 要求變動後掃完一整 pass)。
     params: Vec<InstanceParams>,
@@ -170,6 +178,7 @@ impl IncrementalCut {
             t: 0.0,
             generation: 0,
             packed_generation: u64::MAX,
+            tables_dirty: false,
             cursor: 0,
             params: Vec::new(),
             visited_since_change: 0,
@@ -301,6 +310,7 @@ impl IncrementalCut {
         self.collapse_heap.clear();
         self.forced.clear();
         self.misfit_pinned = false;
+        self.tables_dirty = false;
 
         for (inst, tree) in trees.iter().enumerate() {
             // v2.1.0 慣例:root page 未知就當 page 0(seed_roots 同)
@@ -497,11 +507,25 @@ impl IncrementalCut {
             }
         }
         self.packed_generation = self.generation;
+        self.tables_dirty = false;
         Packed { indices, evicted }
     }
 
     pub(crate) fn needs_pack(&self) -> bool {
-        self.packed_generation != self.generation
+        self.packed_generation != self.generation || self.tables_dirty
+    }
+
+    /// pager 釋放了 `lod_id` 的 `chunk`(`update_lod_trees` 的頁釋放分支呼叫)。只在這個 chunk
+    /// **目前確實有 cut 的孩子住在裡面**(`chunk_refs` > 0)才標髒——expand/collapse 不會因此
+    /// 發生(不改變 cut 集合本身,只是集合裡某些 paged index 現在指向的槽位換了內容),所以
+    /// `generation` 不變,得靠這個獨立旗標讓 `needs_pack()` 抓到「該重 pack 了」。
+    pub(crate) fn note_chunk_released(&mut self, lod_id: u32, chunk: u32) {
+        let Some(inst) = self.lod_ids.iter().position(|&id| id == lod_id) else {
+            return;
+        };
+        if self.chunk_refs[inst].get(&chunk).copied().unwrap_or(0) > 0 {
+            self.tables_dirty = true;
+        }
     }
 
     /// fetchPriority:每 instance 的 root chunk、needed(refcount > 0,chunk 遞增)、wanted(ps 遞減)。
@@ -870,6 +894,34 @@ mod tests {
         let packed = cut.pack(&trees);
         assert_eq!(packed.indices[0], vec![0]);
         assert_eq!(packed.evicted, 0);
+    }
+
+    /// pager 釋放頁(`update_lod_trees` 的頁釋放分支)不會動 `generation`(沒有 expand/collapse),
+    /// `needs_pack()` 得靠 `tables_dirty` 才抓得到「該重 pack 了」——只在被釋放的 chunk 確實有
+    /// cut 的孩子住在裡面才觸發,沒有引用的 chunk / 不存在的 lod_id 都不該誤觸發。
+    #[test]
+    fn note_chunk_released_dirties_only_when_referenced() {
+        let (splats, _) = build_tree();
+        let c2p = [0u32];
+        let trees = views(&splats, &c2p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.0);
+        cut.pack(&trees);
+        assert!(!cut.needs_pack(), "剛 pack 完應該不髒");
+
+        // chunk 0 被 root 引用(見上一個測試的 chunk_refs 斷言)→ 該標髒
+        cut.note_chunk_released(LOD_ID, 0);
+        assert!(cut.needs_pack(), "cut 引用的 chunk 被釋放,應該標髒");
+        cut.pack(&trees);
+        assert!(!cut.needs_pack(), "重 pack 過應該清乾淨");
+
+        // chunk 5:整棵樹只在 chunk 0,沒有任何 cut 節點引用 chunk 5 → 不該標髒
+        cut.note_chunk_released(LOD_ID, 5);
+        assert!(!cut.needs_pack(), "沒被引用的 chunk 釋放不該標髒(避免串流時過度 repack)");
+
+        // 不存在的 lod_id → 不該標髒也不該 panic
+        cut.note_chunk_released(LOD_ID + 1, 0);
+        assert!(!cut.needs_pack(), "不認得的 lod_id 不該標髒");
     }
 
     #[test]

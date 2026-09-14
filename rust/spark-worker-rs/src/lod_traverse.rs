@@ -17,7 +17,9 @@ use crate::lod_splat::LodSplat;
 /// `chunk_to_page` 裡「這個 chunk 不在 GPU」的標記(與 lod_tree.rs 的 0xFFFFFFFF 同值)。
 pub(crate) const NOT_RESIDENT: u32 = 0xFFFF_FFFF;
 
-/// 一個 instance 的姿態與 foveation 參數。round 開始時算一次、續跑沿用。
+/// 一個 instance 的姿態與 foveation 參數。原子路徑(`run_atomic`)每次呼叫重算一次;
+/// 增量路徑(`IncrementalCut::tick`)拿它跟自己存的上一次比對,判斷姿態變了要不要歸零
+/// `visited_since_change`(見 lod_cut.rs)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct InstanceParams {
     pub(crate) origin: Vec3A,
@@ -119,7 +121,9 @@ impl TraverseCore {
         }
     }
 
-    /// output ∪ frontier。**不 drain** —— heap 留給下一片續跑(spec D3)。
+    /// output ∪ frontier。**不 drain**——原子路徑(`run_atomic`)一律跑到 `Done` 才讀,heap 屆時
+    /// 已空,`snapshot()` 純粹是把 `output` 攤成 cut;不 drain 的設計留給 bench 與既有測試
+    /// (`lod_traverse::tests`)驗證「暫停快照仍是合法 cut」時複用同一顆 core 續跑。
     pub(crate) fn snapshot(&self) -> Vec<(u32, u32)> {
         let mut cut = Vec::with_capacity(self.output.len() + self.frontier.len());
         cut.extend_from_slice(&self.output);

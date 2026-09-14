@@ -155,6 +155,11 @@ pub fn dispose_lod_tree(lod_id: u32) {
 #[wasm_bindgen]
 pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32], counts: &[u32], lod_trees: &Array) -> Result<Object, JsValue> {
     STATE.with_borrow_mut(|state| {
+        // 頁釋放(`is_falsy()` 分支)的 (lod_id, chunk) 收集在這裡,等這個迴圈(以及裡面每次
+        // 借用的 `lod_tree`)結束之後才餵給 `state.cut`——`note_chunk_released` 需要 `&mut state.cut`,
+        // 跟迴圈裡借著的 `state.lod_trees` 分開處理,不用在借用還活著時硬擠進同一行。
+        let mut released: Vec<(u32, u32)> = Vec::new();
+
         for (&lod_id, &page_base, &chunk_base, &count, lod_tree_data) in izip!(lod_ids, page_bases, chunk_bases, counts, lod_trees.iter()) {
             let lod_tree = state.lod_trees.get_mut(&lod_id).unwrap();
             let pages = count.div_ceil(65536);
@@ -172,7 +177,8 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
                 for page in 0..pages {
                     lod_tree.page_to_chunk[(base_page + page) as usize] = 0xFFFFFFFF;
                     lod_tree.chunk_to_page[(base_chunk + page) as usize] = 0xFFFFFFFF;
-                }    
+                    released.push((lod_id, base_chunk + page));
+                }
             } else {
                 for page in 0..pages {
                     lod_tree.page_to_chunk[(base_page + page) as usize] = base_chunk + page;
@@ -182,6 +188,13 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
                 let lod_tree_data = Uint32Array::from(lod_tree_data);
                 set_lod_tree_data(state, lod_id, page_base, chunk_base, count, &lod_tree_data);
             }
+        }
+
+        // 方案 B:被釋放的頁若是增量 cut 正在引用的 chunk,強制下次 `traverse_lod_trees` 重 pack
+        // (Task 4 review round 1 F1)——否則 `generation` 沒變、`needs_pack()` 誤判沒事,JS 繼續
+        // 渲染指向舊 chunk 的 paged index,而那個槽位現在住著別的資料。
+        for (lod_id, chunk) in released {
+            state.cut.note_chunk_released(lod_id, chunk);
         }
 
         let result = Object::new();
