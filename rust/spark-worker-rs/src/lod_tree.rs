@@ -453,7 +453,8 @@ pub fn traverse_lod_trees(
             ("scanned", stats.scanned as f64), ("expanded", stats.expanded as f64), ("collapsed", stats.collapsed as f64),
             ("passes", stats.passes as f64), ("evicted", evicted as f64), ("wantedCount", stats.wanted_count as f64),
             ("cutSize", stats.cut_size as f64), ("t", stats.t as f64), ("arenaLeaked", stats.arena_leaked as f64),
-            ("boundSkipped", stats.bound_skipped as f64), ("tickMs", js_sys::Date::now() - t0),
+            ("boundSkipped", stats.bound_skipped as f64), ("requeued", stats.requeued as f64),
+            ("tickMs", js_sys::Date::now() - t0),
         ] {
             Reflect::set(&tick, &JsValue::from_str(k), &JsValue::from(v)).unwrap();
         }

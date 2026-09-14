@@ -148,7 +148,50 @@ pub(crate) struct TickStats {
     pub(crate) t: f32,
     pub(crate) arena_leaked: u32,
     pub(crate) changed: bool,
+    /// D23:這個 tick 把幾個「等頁到達」的拆/收候選直接推回 heap(`requeue_arrivals`)。
+    pub(crate) requeued: u32,
 }
+
+/// 等某個 chunk 到達的拆候選(spec D23):`expand()` 在 `NotResident` 時記下「是誰想拆」,頁到達後的
+/// 下一個 tick(`requeue_arrivals`)直接把它推回 `expand_heap`,不用等掃描 cursor 再轉一整輪回到這個
+/// parent。只記身分(slot / 孩子序 / node.index 驗證用),**不記 ps**——推回 heap 時用那個 tick 的 params
+/// 重算(見 `requeue_arrivals`),heap 裡的 ps 才跟掃描推的是同一種東西。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpandWaiter {
+    pub(crate) slot: u32,
+    pub(crate) i: u16,
+    pub(crate) index: u32,
+}
+
+/// `collapse()` 因「自己的 chunk 不 resident」失敗時記下的收候選(spec D23),對稱於 `ExpandWaiter`。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CollapseWaiter {
+    pub(crate) slot: u32,
+    pub(crate) index: u32,
+}
+
+/// `wanted` 表的值(spec D23)。`ps`/`pass` 是原本 tuple 的兩個欄位(fetch 優先序、過期判斷);
+/// 兩個 waiter 清單是這個 chunk 到達後要直接推回 heap 的候選(`requeue_arrivals`)。
+///
+/// **清單接受重複項、靠推回時的去重標記過濾**(D23 的取捨):同一個候選在頁還沒到之前,每個
+/// 掃描 pass 都會再被推進 heap → pop → `NotResident` → 再記一次,所以每等一個 pass 多一份重複
+/// (CDN 延遲 100–300ms ≈ 1–2 個 pass);推回時第一份把 arena 那格標成 `CUT_QUEUED`(或 `Node.queued`),
+/// 後面的重複項看到「不是 `CUT_LEAF`」直接跳過,heap 裡不會有重複。不在記錄時線性掃清單去重:
+/// 冷啟動時一個 chunk 的等待者是「所有孩子住在這個 chunk 的 cut 葉」,量級是 65536 / 分支數
+/// ≈ 1 萬筆,而一個 tick 可以有幾萬次 `NotResident`,O(清單長度) 的去重會是每 tick 幾億次比較。
+/// 清單超過 `WAITERS_CAP` 就不再記(退回今天的行為:等掃描重新找到),只是上限、不是常態。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Wanted {
+    pub(crate) ps: f32,
+    pub(crate) pass: u32,
+    pub(crate) expand_waiters: Vec<ExpandWaiter>,
+    pub(crate) collapse_waiters: Vec<CollapseWaiter>,
+}
+
+/// 每個 chunk 每種 waiter 清單的上限(spec D23)。一個 chunk 最多 65536 顆節點,所以「孩子住在
+/// 這個 chunk」的 parent 或「自己住在這個 chunk」的 interior 各 ≤ 65536 筆不重複;留一倍給
+/// 跨 pass 的重複項(見 `Wanted`)。12 B 一筆,滿載 1.5 MB / 清單,只在冷啟動的短暫尖峰出現。
+const WAITERS_CAP: usize = 1 << 17;
 
 pub(crate) struct IncrementalCut {
     pub(crate) nodes: Vec<Node>,
@@ -160,13 +203,20 @@ pub(crate) struct IncrementalCut {
     pub(crate) cut_size: usize,
     /// 每 instance:chunk → 住在這個 chunk 的 cut 孩子數(needed 的來源)。
     pub(crate) chunk_refs: Vec<AHashMap<u32, u32>>,
-    /// (inst, chunk) → (想要它的最大 ps = fetch 優先序, 最後一次要它的 pass)。兩個 pass 沒再要就從
-    /// `chunks()` 消失(相機走開了,不該一直叫 pager 抓沒用的頁)。
-    pub(crate) wanted: AHashMap<(u8, u32), (f32, u32)>,
+    /// (inst, chunk) → `Wanted`(想要它的最大 ps = fetch 優先序、最後一次要它的 pass、以及**在等這個
+    /// chunk 的拆/收候選**,spec D23)。兩個 pass 沒再要就從 `chunks()` 消失(相機走開了,不該一直
+    /// 叫 pager 抓沒用的頁)。
+    pub(crate) wanted: AHashMap<(u8, u32), Wanted>,
     pub(crate) lod_ids: Vec<u32>,
     pub(crate) max_splats: usize,
     pub(crate) limit: f32,
     pub(crate) t: f32,
+    /// D23:`note_chunk_resident` 記下「這個 chunk 到了、`wanted` 裡有人在等它」,下一個 `tick()` 在掃描
+    /// 之後、收之前把等待中的候選推回 heap(`requeue_arrivals`)。**不在 `note_chunk_resident` 裡直接推**:
+    /// 那會在 tick 之外憑空製造一個 heap 積壓,D22 把它當成「上一 tick 拆收被打斷的已知工作」跳過掃描
+    /// ——cut 飽和(換位置、停下)時,掃描才找得到要收的節點來騰預算,跳過掃描的結果是推回去的拆候選
+    /// 一個個 misfit、把 `t` 頂高(stream 基準 RELOCATE 段實測 4.5e-2 → 6.8e-2),收得更多、填回來更久。
+    pending_arrivals: Vec<(u8, u32)>,
     pub(crate) generation: u64,
     packed_generation: u64,
     /// pager 釋放了 cut 正在用的頁(`update_lod_trees` 的頁釋放分支),但沒有任何 expand/collapse
@@ -239,6 +289,7 @@ impl IncrementalCut {
             max_splats: 0,
             limit: 0.0,
             t: 0.0,
+            pending_arrivals: Vec::new(),
             generation: 0,
             packed_generation: u64::MAX,
             tables_dirty: false,
@@ -304,9 +355,28 @@ impl IncrementalCut {
         compute_pixel_scale_raw(Vec3A::from_array(center.map(|x| x.to_f32())), size.to_f32(), p)
     }
 
-    fn want(&mut self, inst: u8, chunk: u32, ps: f32) {
+    fn want(&mut self, inst: u8, chunk: u32, ps: f32) -> &mut Wanted {
         let pass = self.passes;
-        self.wanted.entry((inst, chunk)).and_modify(|v| { v.0 = v.0.max(ps); v.1 = pass; }).or_insert((ps, pass));
+        let w = self.wanted.entry((inst, chunk)).or_default();
+        w.ps = w.ps.max(ps);
+        w.pass = pass;
+        w
+    }
+
+    /// D23:記「`slot` 的第 `i` 個孩子想拆,但要等 `chunk` 到」。
+    fn want_expand(&mut self, inst: u8, chunk: u32, ps: f32, slot: u32, i: u16, index: u32) {
+        let w = self.want(inst, chunk, ps);
+        if w.expand_waiters.len() < WAITERS_CAP {
+            w.expand_waiters.push(ExpandWaiter { slot, i, index });
+        }
+    }
+
+    /// D23:記「`slot` 想收,但要等自己的 `chunk` 到」。
+    fn want_collapse(&mut self, inst: u8, chunk: u32, ps: f32, slot: u32, index: u32) {
+        let w = self.want(inst, chunk, ps);
+        if w.collapse_waiters.len() < WAITERS_CAP {
+            w.collapse_waiters.push(CollapseWaiter { slot, index });
+        }
     }
 
     // ── 配置 ───────────────────────────────────────────────────────────────
@@ -389,6 +459,7 @@ impl IncrementalCut {
         self.cut_size = 0;
         self.chunk_refs = trees.iter().map(|_| AHashMap::new()).collect();
         self.wanted.clear();
+        self.pending_arrivals.clear();
         self.lod_ids = trees.iter().map(|t| t.lod_id).collect();
         self.params = trees.iter().map(|t| t.params).collect();
         self.reset_scan_window();
@@ -459,7 +530,7 @@ impl IncrementalCut {
         );
 
         let Some(child) = Self::splat_at(tree, child_index) else {
-            self.want(inst, child_index >> 16, ps);
+            self.want_expand(inst, child_index >> 16, ps, slot, i, node.index);
             return ExpandOutcome::NotResident;
         };
         let LodSplat { child_count, child_start, center, size } = child.clone();
@@ -471,11 +542,18 @@ impl IncrementalCut {
             return ExpandOutcome::Misfit(child_count);
         }
         let spans = Self::chunk_spans(child_start, child_count);
+        // D23:孫子跨兩個 chunk 且兩個都不在時,**兩個都要**(原本看到第一個不在就回頭,第二個要等
+        // 第一個到了、重試、再發現才要——多付一整趟抓取延遲);waiter 也記在每一個要的 chunk 上,
+        // 任一個先到就推回 heap 重試(另一個還沒到就再 `NotResident`,再記一次,lazy)。
+        let mut not_resident = false;
         for &(chunk, n) in &spans {
             if n > 0 && !Self::resident(tree, chunk) {
-                self.want(inst, chunk, ps);
-                return ExpandOutcome::NotResident;
+                self.want_expand(inst, chunk, ps, slot, i, node.index);
+                not_resident = true;
             }
+        }
+        if not_resident {
+            return ExpandOutcome::NotResident;
         }
 
         let base = self.alloc_arena(child_count);
@@ -544,7 +622,7 @@ impl IncrementalCut {
         let inst = node.inst;
         let tree = &trees[inst as usize];
         if !Self::resident(tree, node.index >> 16) {
-            self.want(inst, node.index >> 16, node.ps);
+            self.want_collapse(inst, node.index >> 16, node.ps, slot, node.index);
             return false;
         }
         // parent 的 arena 裡找到自己
@@ -643,17 +721,87 @@ impl IncrementalCut {
     /// 自癒(collapse() 可能因為 parent 自己的 chunk 也不 resident 而失敗,洞會一直卡著,見
     /// `inc_page_return_heals_hole`),標 `tables_dirty` 讓 `needs_pack()` 抓到:下次 `pack()`
     /// 重新掃描孩子的殘留狀態,發現它 resident 了,洞自己補上,不需要真的發生 collapse。
+    ///
+    /// D23(手測 2026-09-14 第三輪:初次載入與停下填滿慢):F1 的「歸零逼重掃」只解決 settled
+    /// 誤判,沒解決**延遲**——等這個 chunk 的候選要等掃描 cursor 轉一整輪回到它的 parent 才會
+    /// 重新被發現,production 一輪 ≈ 4 tick ≈ 200ms,從 root 往下每一層都付一次(抓取延遲 +
+    /// 200ms),v2.1.0 每次重走整棵樹沒有這一項。所以頁到達時記進 `pending_arrivals`,下一個
+    /// `tick()` 把 `wanted` 這一項記著的 waiter(`expand()` / `collapse()` 因它不在而失敗的候選)
+    /// **直接推回 heap**(`requeue_arrivals`,掃描之後、收之前),不等掃描重新找到。
     pub(crate) fn note_chunk_resident(&mut self, lod_id: u32, chunk: u32) {
         let Some(inst) = self.lod_ids.iter().position(|&id| id == lod_id) else {
             return;
         };
         let inst = inst as u8;
         if self.wanted.contains_key(&(inst, chunk)) {
+            self.pending_arrivals.push((inst, chunk));
             self.reset_scan_window();
         }
         if self.chunk_refs[inst as usize].get(&chunk).copied().unwrap_or(0) > 0 {
             self.tables_dirty = true;
         }
+    }
+
+    /// D23:把 `pending_arrivals`(`note_chunk_resident` 記下、`wanted` 裡有人在等的 chunk)的 waiter
+    /// 推回 heap。`tick()` 在掃描之後、收之前呼叫——收候選這個 tick 就收得到,拆候選則排在收騰出預算
+    /// 之後、跟掃描推的候選一起按 ps 由大到小消費。推回前 lazy 驗證(node 活著、index 對得上、arena
+    /// 那格仍是 `CUT_LEAF` / interior 仍 `expanded == 0` 且沒在排隊);ps 用**這個 tick**的 params 重算
+    /// 並套掃描端同一條門檻(`ps > up` / `ps ≤ down ∨ ps ≤ limit·(1−ε) ∨ 超預算`)——waiter 記錄時的 ps
+    /// 可能已經過時(相機走了),推回過時的高 ps 會讓 `expand()` 拆一顆現在其實很遠的節點(消費端不再
+    /// 驗 ps),然後下一輪又收掉,白做。chunk 在 tick 之前又被踢掉了就不動它(waiter 留在 `wanted`
+    /// 等下一次到達)。
+    ///
+    /// `wanted` 這一項**留著**(只把 waiter 清單搬走):它要一直在 `chunks()` 的 wanted 段,直到
+    /// `expand()`/`collapse()` 真的用到它(那裡 `remove`)或兩個 pass 沒人再要。現在就移除的話,
+    /// 這個 tick 的 `chunks()` 可能既沒有它在 needed(refcount 還是 0——waiter 還在 heap 裡沒輪到)
+    /// 也沒有它在 wanted,pager 在池子滿載時就可能把剛到的頁當可釋放的踢掉。
+    fn requeue_arrivals(&mut self, trees: &[TreeView], up: f32, down: f32, limit_down: f32) -> u32 {
+        let mut requeued = 0u32;
+        let over_budget = self.cut_size > self.max_splats;
+        let arrivals = std::mem::take(&mut self.pending_arrivals);
+        for (inst, chunk) in arrivals {
+            if !Self::resident(&trees[inst as usize], chunk) {
+                continue;
+            }
+            let Some(w) = self.wanted.get_mut(&(inst, chunk)) else {
+                continue;
+            };
+            let expand_waiters = std::mem::take(&mut w.expand_waiters);
+            let collapse_waiters = std::mem::take(&mut w.collapse_waiters);
+            let p = &trees[inst as usize].params;
+            for ExpandWaiter { slot, i, index } in expand_waiters {
+                let node = self.nodes[slot as usize];
+                if !node.alive || node.index != index || i >= node.child_count {
+                    continue;
+                }
+                let arena_i = (node.children_base + i as u32) as usize;
+                let c = self.arena[arena_i];
+                // `!= CUT_LEAF`:已展開 / 樹葉 / 已經在 heap 裡(重複的 waiter 到這裡被濾掉)。
+                if c.slot != CUT_LEAF {
+                    continue;
+                }
+                let ps = Self::ps_of(c.center, c.size, p);
+                if ps > up {
+                    self.expand_heap.push((OrderedFloat(ps), slot, i, index));
+                    self.arena[arena_i].slot = CUT_QUEUED;
+                    requeued += 1;
+                }
+            }
+            for CollapseWaiter { slot, index } in collapse_waiters {
+                let node = self.nodes[slot as usize];
+                if !node.alive || node.index != index || node.parent == NONE || node.expanded != 0 || node.queued {
+                    continue;
+                }
+                let ps = Self::ps_of(node.center, node.size, p);
+                self.nodes[slot as usize].ps = ps;
+                if ps <= down || ps <= limit_down || over_budget {
+                    self.collapse_heap.push(Reverse((OrderedFloat(ps), slot, index)));
+                    self.nodes[slot as usize].queued = true;
+                    requeued += 1;
+                }
+            }
+        }
+        requeued
     }
 
     /// fetchPriority:每 instance 的 root chunk、needed(refcount > 0,chunk 遞增)、wanted(ps 遞減)。
@@ -676,7 +824,7 @@ impl IncrementalCut {
         }
         let needed = list.len() - roots;
         let mut w: Vec<_> = self.wanted.iter().collect();
-        w.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(b.0)));
+        w.sort_by(|a, b| b.1.ps.partial_cmp(&a.1.ps).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(b.0)));
         for (&(inst, chunk), _) in w {
             let id = self.lod_ids[inst as usize];
             if !list.contains(&(id, chunk)) {
@@ -695,7 +843,8 @@ impl IncrementalCut {
     pub(crate) fn settled(&self) -> bool {
         self.visited_since_change >= self.nodes.len()
             && self.expand_heap.is_empty() && self.collapse_heap.is_empty()
-            && self.forced.is_empty() && self.cut_size <= self.max_splats
+            && self.forced.is_empty() && self.pending_arrivals.is_empty()
+            && self.cut_size <= self.max_splats
     }
 
     /// 整批丟棄 `expand_heap`(門檻/params 變了、或消費端判斷剩下的都不用看了)。丟棄前把還沒被
@@ -819,7 +968,7 @@ impl IncrementalCut {
                 // 過去 `chunks()` 內建的過濾器完全相同(`v.1 >= passes.saturating_sub(1)`
                 // ⟺ `v.1 + 1 >= passes`),只是把清理挪到源頭,不用每次查詢都重算。
                 let p = self.passes;
-                self.wanted.retain(|_, v| v.1 + 1 >= p);
+                self.wanted.retain(|_, v| v.pass + 1 >= p);
             }
             let slot = self.cursor as u32;
             self.cursor += 1;
@@ -899,6 +1048,9 @@ impl IncrementalCut {
         // 掃到 n 筆但沒 wrap(cursor == n)的話,下一 tick 開頭才會真正 wrap、bump `passes`。
         // 「這一輪掃完了沒」現在完全交給 `visited_since_change >= nodes.len()` 判斷(見該欄位/`settled()`),
         // 不再靠這裡的 wrap 時機順便判一次 clean pass。
+
+        // ── 1b. D23:頁到達的 waiter 推回 heap(掃描之後、收之前,見 `requeue_arrivals`)──
+        st.requeued = self.requeue_arrivals(trees, up, down, limit_down);
 
         // ── 2. 收:forced(頁被踢)無條件;候選在「超預算」或「ps ≤ limit」時 ──
         let forced = std::mem::take(&mut self.forced);
@@ -1328,7 +1480,7 @@ mod tests {
         let ExpandOutcome::Expanded(n4) = cut.expand(&trees, n0, 3, 1.0, 100) else { panic!() };
         // 節點 20 = n4 的第 3 個孩子;孩子 chunk 1 不 resident → NotResident + wanted
         assert_eq!(cut.expand(&trees, n4, 3, 0.5, 100), ExpandOutcome::NotResident);
-        assert_eq!(cut.wanted.get(&(0, 1)).map(|v| v.0), Some(0.5));
+        assert_eq!(cut.wanted.get(&(0, 1)).map(|v| v.ps), Some(0.5));
         let chunks = cut.chunks();
         assert_eq!(chunks.roots, 1);
         assert_eq!(chunks.needed, 0, "cut 全在 chunk 0 = root chunk,已在 roots 段、needed 不重複列");
@@ -2013,6 +2165,89 @@ mod tests {
         }
         assert_eq!(cut.cut_size, 64);
         assert!(cut.wanted.is_empty());
+    }
+
+    /// D23:頁到達時等它的**拆**候選直接推回 heap,不等掃描。樹形同 `inc_nonresident_children_wanted_then_expanded`
+    /// (節點 20 的孩子在 chunk 1,不 resident)。settle 之後 chunk 1 到了:`note_chunk_resident` →
+    /// **一個** tick,掃描配額在第一筆就喊停(`deadline_stride = 1` + `|| true`,掃描什麼都找不到)
+    /// → 節點 20 仍在這個 tick 被拆(cut 61 → 64)。D23 之前:掃描被擋、heap 空 → 什麼都不發生(RED)。
+    #[test]
+    fn inc_page_arrival_requeues_waiter() {
+        let (mut splats, _) = build_tree();
+        splats[20] = LodSplat::new(glam::Vec3::new(20.0, 1.0, 0.0), 2.0, 65536, 4);
+        let mut splats2 = splats.clone();
+        splats2.resize(2 * 65536, LodSplat::default());
+        for k in 0..4usize {
+            splats2[65536 + k] = LodSplat::new(glam::Vec3::new(8.0 + k as f32 * 0.1, 2.0, 0.0), 1.0, 0, 0);
+        }
+        let p = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let c2p = [0u32, NOT_RESIDENT];
+        let trees = views_p(&splats2, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        assert!(cut_indices(&cut).contains(&20));
+        assert_eq!(cut.cut_size, 61);
+        let w = cut.wanted.get(&(0, 1)).expect("chunk 1 要在 wanted");
+        assert!(!w.expand_waiters.is_empty(), "節點 20 的拆候選要記成 waiter");
+        assert!(w.expand_waiters.iter().all(|x| x.index == 4), "waiter 的 node 是節點 4(20 的 parent)");
+        assert_eq!(cut.heap_lens_for_test(), (0, 0));
+
+        // 頁到了:chunk 1 → page 1
+        let c2p2 = [0u32, 1];
+        let trees2 = views_p(&splats2, &c2p2, p);
+        cut.note_chunk_resident(LOD_ID, 1);
+        assert!(!cut.settled(), "有 pending arrival 就不算 settled");
+        assert_eq!(cut.heap_lens_for_test(), (0, 0), "推回 heap 發生在下一個 tick 裡,不在通知當下");
+
+        cut.deadline_stride = 1;
+        let st = cut.tick(&trees2, &[0], 1000, 0.03, 0.0, &mut || true, &mut || false);
+        assert_eq!(st.scanned, 0, "掃描被第一筆就喊停,這個 tick 不靠掃描");
+        assert_eq!(st.requeued, 1, "恰好一個候選(節點 20)推回 heap;重複的 waiter 被 CUT_QUEUED 濾掉");
+        assert_eq!(st.expanded, 1);
+        assert!(!cut_indices(&cut).contains(&20));
+        assert_eq!(cut.cut_size, 64);
+        assert!(cut.wanted.is_empty());
+    }
+
+    /// D23 的收版本:parent(節點 1..=4,在 chunk 1)自己的 chunk 不 resident → 拉遠時收不了、
+    /// 記成 collapse waiter;chunk 1 回來 → `note_chunk_resident` → **一個** 掃描被擋的 tick 就收到 L1。
+    #[test]
+    fn inc_page_arrival_requeues_collapse_waiter() {
+        let (splats0, _) = build_tree();
+        let mut splats = vec![LodSplat::default(); 2 * 65536];
+        for (i, s) in splats0.iter().enumerate() {
+            if (1..=4).contains(&i) { splats[65536 + i] = s.clone(); } else { splats[i] = s.clone(); }
+        }
+        splats[0] = LodSplat::new(glam::Vec3::ZERO, 8.0, 65537, 4);
+        let near = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let far = pose(Vec3A::new(0.0, 0.0, -150.0));
+        let c2p = [0u32, 1];
+        let trees = views_p(&splats, &c2p, near);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        assert_eq!(cut.cut_size, 64);
+        let c2p_evicted = [0u32, NOT_RESIDENT];
+        let trees_far = views_p(&splats, &c2p_evicted, far);
+        for _ in 0..10 { cut.tick(&trees_far, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false); }
+        assert_eq!(cut_indices(&cut), (5..=20).collect::<Vec<_>>());
+        let w = cut.wanted.get(&(0, 1)).expect("chunk 1 要在 wanted");
+        assert!(w.collapse_waiters.len() >= 4, "四顆 parent 各至少一筆 waiter(每個 pass 再記一次,允許重複)");
+        assert!(w.expand_waiters.is_empty());
+        assert_eq!(cut.heap_lens_for_test(), (0, 0));
+
+        // 頁回來
+        let trees_back = views_p(&splats, &c2p, far);
+        cut.note_chunk_resident(LOD_ID, 1);
+        assert!(!cut.settled());
+        cut.deadline_stride = 1;
+        let st = cut.tick(&trees_back, &[0], 1000, 0.03, 0.0, &mut || true, &mut || false);
+        assert_eq!(st.scanned, 0);
+        assert_eq!(st.requeued, 4, "四顆 parent 各推回一次;重複 waiter 被 Node.queued 濾掉");
+        assert_eq!(st.collapsed, 4);
+        assert_eq!(cut_indices(&cut), vec![65537, 65538, 65539, 65540]);
+        assert!(!cut.wanted.contains_key(&(0, 1)));
     }
 
     /// F2 回歸測試(review 最終輪):被 evicted 的葉子若因為「parent 自己的 chunk 也不 resident」

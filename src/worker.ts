@@ -742,6 +742,8 @@ export type LodTickStats = {
   changed: boolean;
   tickMs: number;
   boundSkipped: number;
+  /** D23:這個 tick 把幾個「等頁到達」的拆/收候選直接推回 heap(不等掃描重新找到)。 */
+  requeued: number;
   /** D22:這次呼叫有沒有交出 `instanceIndices`(= `packNow && needs_pack()`)。 */
   packed: boolean;
   /**

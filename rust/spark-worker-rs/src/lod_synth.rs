@@ -469,6 +469,119 @@ pub(crate) fn fill_main(rounds: usize, eps: f32, pack_every: usize) {
     );
 }
 
+/// 「串流」模擬(D23,2026-09-14 手測「初次載入 / 停下填滿慢」的重現),兩段:
+///
+/// 1. **COLD**(初次載入):同一棵 256 頁的合成樹,一開始**只有 chunk 0 resident**(`chunk_to_page`
+///    其餘全 `NOT_RESIDENT`),姿態 `POSES[0]`,tick 到 `cut_size ≥ 0.95·max`(max 2.5M)。
+/// 2. **RELOCATE**(停下填滿):cut 已經 2.5M,姿態跳到 `POSES[1]`(遠處、沒去過的地方,那裡的
+///    chunk 都還沒 resident),tick 到 settled 且沒東西可抓。這一段的 cut 一直是 2.5M 量級,一輪掃描
+///    要切成好幾個 tick,正是手測看到的「停下後每一層都等一輪掃描」的情境。
+///
+/// 兩段都用同一條「pager」:每個 tick 之後把 `chunks()` 的 wanted 段(roots+needed 之後)**依序**取前
+/// `per_tick` 個還沒 resident 的 chunk 標成 resident(用 `page_out` 的同一組映射)並呼叫
+/// `note_chunk_resident` —— 模擬 pager 的 3 個 fetcher 在下一個 tick 送到。deadline 是真的
+/// (掃描 12ms / 全部 20ms,同 `walk_main`)。每段印 tick 數、wasm 總毫秒、到達的 chunk 數、
+/// 被直接推回 heap 的候選數,以及 **ARRIVAL→USE**:一個 chunk 從「到達」到「第一次被 cut 用到」
+/// (出現在 `chunks()` 的 needed 段)的延遲(tick),mean / max / 超過 1 tick 的 chunk 數。
+///
+/// 可證偽的期望(D23):**頁到達時把等待中的拆/收候選直接推回 heap** 之後,ARRIVAL→USE 應該恆為
+/// 1 tick(下一個 tick 就拆進去),而不是「等掃描 cursor 轉回它的 parent」(最多一整 pass,RELOCATE
+/// 段 ≈ 4 tick)。總 tick 數則被拆的吞吐量(每 tick 20ms 拆得完幾萬顆)與到達率(`per_tick`)一起
+/// 主宰,合成樹是 BFS 分塊、frontier 很寬,所以總 tick 數不會出現「層數 × 4」那種倍數差——看 ARRIVAL→USE。
+#[allow(dead_code)]
+// 同 `fill_main`:`is_multiple_of` 是 1.87 才穩定,workspace 的 rust-version 是 1.82。
+#[allow(clippy::manual_is_multiple_of)]
+pub(crate) fn stream_main(rounds: usize, eps: f32, per_tick: usize) {
+    use crate::lod_cut::IncrementalCut;
+    use crate::lod_traverse::NOT_RESIDENT;
+    use std::time::Instant;
+    const TICK_CAP: u32 = 20_000;
+    let max = 2_500_000usize;
+    let tree = build_synth(7, 256 * CHUNK, 256.0);
+    let (splats, c2p, root_page) = page_out(&tree);
+    let limit = PIXEL_SCALE_LIMIT;
+    let goal = (0.95 * max as f64) as usize;
+    eprintln!("STREAM PARAMS: eps={eps} per_tick={per_tick} max={max} goal={goal} chunks={}", tree.num_chunks);
+
+    struct Phase { ticks: u32, sum_tick: f64, arrivals: u64, requeued: u64, lat_mean: f64, lat_max: u32, lat_over1: usize, cut: usize }
+    // 一段:tick 到 `until_goal`(cut ≥ goal)或 settled 且沒東西可抓。
+    let run_phase = |label: &str, cut: &mut IncrementalCut, live: &mut Vec<u32>, p: InstanceParams, until_goal: bool| -> Phase {
+        let mut ticks = 0u32;
+        let mut sum_tick = 0.0;
+        let mut arrivals = 0u64;
+        let mut requeued = 0u64;
+        let mut landed_at: Vec<u32> = vec![u32::MAX; c2p.len()];
+        let mut use_lat: Vec<u32> = Vec::new();
+        let wall = Instant::now();
+        let reason;
+        loop {
+            ticks += 1;
+            let trees = [TreeView { lod_id: 1, splats: &splats, chunk_to_page: live, params: p }];
+            let t = Instant::now();
+            let scan_at = t + std::time::Duration::from_millis(12);
+            let deadline_at = t + std::time::Duration::from_millis(20);
+            let st = cut.tick(&trees, &[root_page], max, limit, eps, &mut || Instant::now() >= scan_at, &mut || Instant::now() >= deadline_at);
+            sum_tick += t.elapsed().as_secs_f64() * 1e3;
+            requeued += st.requeued as u64;
+            let ch = cut.chunks();
+            for &(_, c) in ch.list[ch.roots..ch.roots + ch.needed].iter() {
+                let at = landed_at[c as usize];
+                if at != u32::MAX {
+                    use_lat.push(ticks - at);
+                    landed_at[c as usize] = u32::MAX;
+                }
+            }
+            let mut landed = 0usize;
+            for &(_, c) in ch.list[ch.roots + ch.needed..].iter() {
+                if landed >= per_tick { break; }
+                if live[c as usize] != NOT_RESIDENT { continue; }
+                live[c as usize] = c2p[c as usize];
+                landed_at[c as usize] = ticks;
+                arrivals += 1;
+                cut.note_chunk_resident(1, c);
+                landed += 1;
+            }
+            if ticks <= 60 || ticks % 25 == 0 {
+                eprintln!("{label} tick {ticks}: cut {}  scan {} exp {} col {} wanted {} t {:.3e} settled {}  landed {landed}",
+                    st.cut_size, st.scanned, st.expanded, st.collapsed, st.wanted_count, st.t, st.settled);
+            }
+            if until_goal && cut.cut_size >= goal { reason = "reached"; break; }
+            if st.settled && landed == 0 && st.wanted_count == 0 { reason = "settled"; break; }
+            if ticks >= TICK_CAP { reason = "cap"; break; }
+        }
+        let wall_ms = wall.elapsed().as_secs_f64() * 1e3;
+        let lat_n = use_lat.len().max(1) as f64;
+        let lat_mean = use_lat.iter().map(|&x| x as f64).sum::<f64>() / lat_n;
+        let lat_max = use_lat.iter().copied().max().unwrap_or(0);
+        let lat_over1 = use_lat.iter().filter(|&&x| x > 1).count();
+        eprintln!(
+            "{label}: {ticks} ticks ({reason}) tick-sum {sum_tick:.1} ms wall {wall_ms:.1} ms cut {} arrivals {arrivals} requeued {requeued} | ARRIVAL→USE: {} chunks, mean {lat_mean:.2} ticks, max {lat_max}, >1 tick: {lat_over1}",
+            cut.cut_size, use_lat.len()
+        );
+        Phase { ticks, sum_tick, arrivals, requeued, lat_mean, lat_max, lat_over1, cut: cut.cut_size }
+    };
+
+    let mut best_cold: Option<Phase> = None;
+    let mut best_reloc: Option<Phase> = None;
+    for round in 0..rounds {
+        let mut live: Vec<u32> = vec![NOT_RESIDENT; c2p.len()];
+        live[0] = c2p[0];
+        let mut cut = IncrementalCut::new();
+        let cold = run_phase(&format!("COLD r{round}"), &mut cut, &mut live, params(POSES[0].0, POSES[0].1), true);
+        assert!(cold.cut >= goal, "串流冷啟動填不到 0.95×max:cut {} goal {goal}", cold.cut);
+        let reloc = run_phase(&format!("RELOCATE r{round}"), &mut cut, &mut live, params(POSES[1].0, POSES[1].1), false);
+        assert!(reloc.cut >= goal, "換位置後填不到 0.95×max:cut {} goal {goal}", reloc.cut);
+        if best_cold.as_ref().is_none_or(|b| cold.ticks < b.ticks) { best_cold = Some(cold); }
+        if best_reloc.as_ref().is_none_or(|b| reloc.ticks < b.ticks) { best_reloc = Some(reloc); }
+    }
+    for (label, b) in [("COLD", best_cold.unwrap()), ("RELOCATE", best_reloc.unwrap())] {
+        eprintln!(
+            "STREAM {label} MIN of {rounds}: {} ticks, tick-sum {:.1} ms (cut {}) | arrivals {}, requeued {} | ARRIVAL→USE mean {:.2} max {} >1: {}",
+            b.ticks, b.sum_tick, b.cut, b.arrivals, b.requeued, b.lat_mean, b.lat_max, b.lat_over1
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

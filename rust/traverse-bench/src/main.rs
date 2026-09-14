@@ -20,6 +20,14 @@ fn main() {
         let eps = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.05);
         let diag = args.get(4).map(String::as_str) == Some("1");
         lod_synth::walk_main(rounds, eps, diag);
+    } else if args.get(1).map(String::as_str) == Some("stream") {
+        // stream 模式(D23):串流冷啟動——只有 chunk 0 resident,每 tick 依 wanted 順序送到 per_tick 個
+        // chunk(模擬 3 個 fetcher 一 tick 後到達),數填到 0.95·2.5M 的 tick / ms。
+        // args[2] = rounds(預設 1);args[3] = eps(預設 0.05);args[4] = per_tick(預設 3)。
+        let rounds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let eps = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.05);
+        let per_tick = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
+        lod_synth::stream_main(rounds, eps, per_tick);
     } else if args.get(1).map(String::as_str) == Some("fill") {
         // fill 模式(D22):同姿態 2.5M settle → max 10M,數填滿的 tick 與毫秒,對照原子 10M。
         // args[2] = rounds(預設 1);args[3] = eps(預設 0.05);args[4] = pack_every

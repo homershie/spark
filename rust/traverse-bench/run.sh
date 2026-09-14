@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # LoD traverse 基準:原生 + wasm32-wasip1(Node 內建 WASI 跑,不用裝 wasmtime)。
-# 用法:rust/traverse-bench/run.sh [native|wasm|both|walk|fill] [rounds] [eps] [diag|pack_every]
+# 用法:rust/traverse-bench/run.sh [native|wasm|both|walk|fill|stream] [rounds] [eps] [diag|pack_every|per_tick]
 # walk 模式呼叫 lod_synth::walk_main(20 站走路模擬,方案 B Task 5),rounds 預設 1(= 20 站)、
 # 原生 + wasm 都跑。eps = 遲滯帶,預設 0.05(production 值,spec D6 2026-09-14 更新;
 # 例如 `run.sh walk 1 0.0` 測零遲滯,Task 5 review round 2 用來跟原子比對)。diag = "1"
@@ -25,6 +25,13 @@ if [[ "$mode" == "fill" ]]; then
   bin_args=(fill "$rounds")
   [[ -n "${3:-}" ]] && bin_args+=("$3")
   [[ -n "${4:-}" ]] && { [[ -z "${3:-}" ]] && bin_args+=("0.05"); bin_args+=("$4"); }
+elif [[ "$mode" == "stream" ]]; then
+  # stream 模式(D23):串流冷啟動,只有 chunk 0 resident、每 tick 送到 per_tick 個 wanted chunk。
+  # run.sh stream [rounds] [eps] [per_tick];per_tick 預設 3(= pager 的 numFetchers)。
+  rounds="${2:-1}"
+  bin_args=(stream "$rounds")
+  [[ -n "${3:-}" ]] && bin_args+=("$3")
+  [[ -n "${4:-}" ]] && { [[ -z "${3:-}" ]] && bin_args+=("0.05"); bin_args+=("$4"); }
 elif [[ "$mode" == "walk" ]]; then
   rounds="${2:-1}"
   bin_args=(walk "$rounds")
@@ -38,11 +45,11 @@ else
 fi
 native_status=0
 wasm_status=0
-if [[ "$mode" == "native" || "$mode" == "both" || "$mode" == "walk" || "$mode" == "fill" ]]; then
+if [[ "$mode" == "native" || "$mode" == "both" || "$mode" == "walk" || "$mode" == "fill" || "$mode" == "stream" ]]; then
   echo "== native =="
   cargo run --release -q -p traverse-bench -- "${bin_args[@]}" || native_status=$?
 fi
-if [[ "$mode" == "wasm" || "$mode" == "both" || "$mode" == "walk" || "$mode" == "fill" ]]; then
+if [[ "$mode" == "wasm" || "$mode" == "both" || "$mode" == "walk" || "$mode" == "fill" || "$mode" == "stream" ]]; then
   echo "== wasm32-wasip1 (node) =="
   RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" \
     cargo build --release -q -p traverse-bench --target wasm32-wasip1 || { echo "wasm build failed" >&2; exit 1; }
