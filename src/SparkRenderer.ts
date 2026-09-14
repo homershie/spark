@@ -12,14 +12,6 @@ import { SplatAccumulator } from "./SplatAccumulator";
 import { SplatGeometry } from "./SplatGeometry";
 import { SplatWorker } from "./SplatWorker";
 import { SPLAT_TEX_HEIGHT, SPLAT_TEX_WIDTH } from "./defines";
-import {
-  type LodRound,
-  type LodRoundStats,
-  canAbortRound,
-  newLodRound,
-  shouldApplySlice,
-  sliceBudget,
-} from "./lodRound";
 import { getShaders } from "./shaders";
 import {
   cloneClock,
@@ -29,6 +21,7 @@ import {
   isOculus,
   isVisionPro,
 } from "./utils";
+import type { LodTickStats } from "./worker";
 
 export interface SparkRendererOptions {
   /**
@@ -213,30 +206,18 @@ export interface SparkRendererOptions {
    */
   lodRenderScale?: number;
   /**
-   * LoD traverse 時間切片:每片預算(ms)。每片結束把目前的 cut 套到 GPU,下一幀續跑。
-   * 0 = 關閉(v2.1.0 行為:跑到底才套)。給 40 之類的值會啟用切片,但切片對**走路**(姿態持續
-   * 變動)沒有幫助 —— 每次姿態變都從 root 重開、累積不出完整 cut;它只對「靜止 → 轉頭 → 靜止」
-   * 有效。預設關閉,留作 A/B 與增量式 traverse 的地基。
-   * @default 0
+   * LoD cut 走增量(方案 B):保留上一幀的展開樹、姿態變了只局部拆 / 收,每 tick(一次 worker
+   * 呼叫)交一次合法 cut。false = 每次姿態變動從 root 原子重走(v2.1.0 行為,A/B 對照)。
+   * 設計:spark-react-r3f `docs/superpowers/specs/2026-09-11-incremental-traverse-design.md`。
+   * @default true
    */
-  lodSliceMs?: number;
-  /**
-   * 第一片預算(ms);0 = 同 lodSliceMs。拉長它可壓「轉頭時重疊區先變粗再變細」。
-   * @default 0
-   */
-  lodFirstSliceMs?: number;
-  /**
-   * round 開始後 N ms 內不被姿態變動中止(0 = 一髒就重開)。
-   * @default 0
-   */
-  lodHoldMs?: number;
-  /**
-   * 「不可見的降級」規則:pose/init 輪的中間片只有在「這片的總顆數 ≥ lodApplyMinFraction ×
-   * 螢幕上現有 cut 的總顆數」時才套用;`done` 的那片一律套用;tree 輪(原子)一律套用。
-   * 0 = 每片都套(走路時每輪只活一片 → 永遠是最粗的 cut)。
-   * @default 0.5
-   */
-  lodApplyMinFraction?: number;
+  lodIncremental?: boolean;
+  /** 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。 */
+  lodTickMs?: number;
+  /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
+  lodHysteresis?: number;
+  /** 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。 */
+  lodApplyIntervalMs?: number;
   /**
    * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
    * @default false
@@ -420,29 +401,37 @@ export class SparkRenderer extends THREE.Mesh {
   lodSplatCount?: number;
   lodSplatScale: number;
   lodRenderScale: number;
-  /** 切片預算(ms);0 = 關閉(預設,v2.1.0 行為)。切片只對「靜止 → 轉頭 → 靜止」有效,走路情境評估未過,見選項說明。 */
-  lodSliceMs: number;
-  lodFirstSliceMs: number;
-  lodHoldMs: number;
-  lodApplyMinFraction: number;
-  /** 最後一份**真的套到 GPU** 的 cut 的總顆數(shouldApplySlice 的分母)。 */
-  private lastAppliedSplats = 0;
-  /** 那份 cut 回來時的 chunks —— 沒套用的片要把它接在 fetchPriority 後面,螢幕上的頁才不會被 pager 釋放(spec §4.5)。 */
-  private lastAppliedChunks: [number, number][] = [];
-  /** 目前在跑的 round;null = 沒有。cause=pose/init 切片跑;cause=tree 原子一次跑完(相機沒動不閃粗版)。 */
-  lodRound: LodRound | null = null;
-  /** 頁面更新到了、但要等這輪跑完再補一輪(見 lodRound.ts / driveLod);補的那輪走原子,不切片。 */
-  lodTreeDirty = false;
-  /** 每結束一輪(完成或中止)+1;讀數的邊緣訊號。 */
-  lodRoundSeq = 0;
-  /** 最近結束的一輪。 */
-  lastLodRound?: LodRoundStats;
   /**
-   * round 開始時算的位移預測(沿用 v2.1.0 的 deltaPred,updateLodInstances 目前沒用它)。
-   * ⚠️ `lastTraverseTime` 現在是**一片**的時間而非整輪,所以這個預測是 slice-scaled ——
-   * 誰要重新啟用 `viewPos.add(deltaPred)` 得先換成整輪的時間。
+   * LoD cut 走增量(方案 B):保留上一幀的展開樹、姿態變了只局部拆 / 收。false = 每次姿態
+   * 變動從 root 原子重走(v2.1.0 行為,A/B 對照)。
    */
-  private lodDeltaPred = new THREE.Vector3();
+  lodIncremental: boolean;
+  /** 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。 */
+  lodTickMs: number;
+  /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
+  lodHysteresis: number;
+  /** 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。 */
+  lodApplyIntervalMs: number;
+  /** 最近一次 tick 的讀數;null = 還沒 tick 過。 */
+  lastLodTick:
+    | (LodTickStats & { neededChunks: number; pagePressure: boolean })
+    | null = null;
+  /** 每完成一次 tick(`lastLodTick` 被更新)+1;讀數的邊緣訊號。 */
+  lodTickSeq = 0;
+  /** 最近一次 pose 髒 → settled 的毫秒;還沒 settled 期間是 null。 */
+  lodSettleMs: number | null = null;
+  /** 最近一次姿態變髒的 performance.now();用於量測 lodSettleMs。 */
+  private lodPoseDirtyAt = 0;
+  /** 上一次把 lodPendingIndices 套進 GPU 的 performance.now()(節流用)。 */
+  private lodLastApplyAt = 0;
+  /** 被節流延後、還沒套進 GPU 的最新一份索引;下次到期的幀套用。 */
+  private lodPendingIndices: Record<
+    string,
+    { lodId: number; numSplats: number; indices: Uint32Array }
+  > | null = null;
+  private lodPendingUuidToMesh: Map<string, SplatMesh> | null = null;
+  /** 頁面更新到了、但要等這次 tick settled 再補一次;見 driveLod。 */
+  lodTreeDirty = false;
   lodInflate: boolean;
   pagedExtSplats: boolean;
   maxPagedSplats: number;
@@ -631,10 +620,10 @@ export class SparkRenderer extends THREE.Mesh {
     this.lodSplatCount = options.lodSplatCount;
     this.lodSplatScale = options.lodSplatScale ?? 1.0;
     this.lodRenderScale = options.lodRenderScale ?? 1.0;
-    this.lodSliceMs = options.lodSliceMs ?? 0;
-    this.lodFirstSliceMs = options.lodFirstSliceMs ?? 0;
-    this.lodHoldMs = options.lodHoldMs ?? 0;
-    this.lodApplyMinFraction = options.lodApplyMinFraction ?? 0.5;
+    this.lodIncremental = options.lodIncremental ?? true;
+    this.lodTickMs = options.lodTickMs ?? 20;
+    this.lodHysteresis = options.lodHysteresis ?? 0.05;
+    this.lodApplyIntervalMs = options.lodApplyIntervalMs ?? 50;
     this.lodInflate = options.lodInflate ?? false;
     this.pagedExtSplats = options.pagedExtSplats ?? false;
     const defaultPages = isMobile() ? (isIos() ? 96 : 128) : 256;
@@ -1432,20 +1421,15 @@ export class SparkRenderer extends THREE.Mesh {
         this.lodTreeDirty = true;
       }
 
-      // ── round 生命週期(spec §5.3)──
+      // ── 方案 B:髒了、或 cut 還沒 settled,就 tick 一次(spec §5.2)──
       const roundNow = performance.now();
-      if (
-        this.lodDirty &&
-        canAbortRound(this.lodRound, roundNow, this.lodHoldMs)
-      ) {
-        const deltaPred = new THREE.Vector3();
-        if (this.lastLod) {
-          const deltaTime = Math.max(1, roundNow - this.lastLod.timestamp);
-          deltaPred
-            .copy(viewPos)
-            .sub(this.lastLod.pos)
-            .multiplyScalar(this.lastTraverseTime / deltaTime);
-        }
+      const poseDirty = this.lodDirty;
+      const needTick =
+        this.lodDirty ||
+        this.lodTreeDirty ||
+        (this.lodIncremental && !(this.lastLodTick?.settled ?? false));
+      if (poseDirty) this.lodPoseDirtyAt = roundNow;
+      if (this.lodDirty) {
         this.lastLod = {
           pos: viewPos,
           quat: viewQuat,
@@ -1455,58 +1439,50 @@ export class SparkRenderer extends THREE.Mesh {
         };
         this.lodDirty = false;
         this.lodDirtyOwned = false;
-        // 新 round 從 root 重開,updateLodTrees 這幀已經跑過,它看得到那批頁 —— 不必再補 tree 輪
-        this.lodTreeDirty = false;
-        if (this.lodRound && !this.lodRound.done) {
-          this.finishLodRound(this.lodRound, true);
-        }
-        this.lodRound = newLodRound(
-          roundNow,
-          this.lodRound ? "pose" : "init",
-          this.pager?.fetchers.length ?? 0,
+        this.lodSettleMs = null;
+      }
+      this.lodTreeDirty = false;
+
+      // 節流期間留下來的那份索引,這一幀到期就套
+      if (
+        this.lodPendingIndices &&
+        this.lodPendingUuidToMesh &&
+        roundNow - this.lodLastApplyAt >= this.lodApplyIntervalMs
+      ) {
+        this.updateLodIndices(
+          this.lodPendingUuidToMesh,
+          this.lodPendingIndices,
         );
-        this.lodDeltaPred = deltaPred;
-      } else if ((!this.lodRound || this.lodRound.done) && this.lodTreeDirty) {
-        this.lodTreeDirty = false;
-        this.lodRound = newLodRound(
-          roundNow,
-          "tree",
-          this.pager?.fetchers.length ?? 0,
-        );
+        this.lodLastApplyAt = roundNow;
+        this.lodPendingIndices = null;
+        this.lodPendingUuidToMesh = null;
+        this.setDirty();
       }
 
-      if (this.lodRound && !this.lodRound.done) {
-        const round = this.lodRound;
-        // cause=tree(頁面到了、相機沒動)走原子:相機沒動就沒有「先看到粗版」的理由,
-        // 切片會讓畫面先退成粗 cut 再細回來(看起來像從頭重來 ~3 次);原子一次換掉整份 cut,
-        // = v2.1.0 的行為,不會閃。只有 pose / init 輪才切片。
-        const budgetMs =
-          round.cause === "tree"
-            ? 0
-            : sliceBudget(round.slice, this.lodSliceMs, this.lodFirstSliceMs);
-        const { done, applied } = await this.updateLodInstances(
+      if (needTick) {
+        const tick = await this.updateLodInstances(
           worker,
-          this.lodDeltaPred,
           lodMeshes,
           maxSplats,
           viewPos,
           viewQuat,
           pixelScaleLimit,
-          { budgetMs, restart: round.restart },
+          {
+            budgetMs: this.lodIncremental ? this.lodTickMs : 0,
+            incremental: this.lodIncremental,
+            hysteresis: this.lodHysteresis,
+          },
         );
-        round.restart = false;
-        round.slice += 1;
-        // applied / firstApplyMs 只算真的套到 GPU 的片:firstApplyMs 量的是第一次「看得見」的更新,
-        // canAbortRound 的 applied > 0 底線也因此是「螢幕至少顯示過這輪一次」。
-        if (applied) {
-          round.applied += 1;
-          if (round.applied === 1) {
-            round.firstApplyMs = performance.now() - round.startedAt;
+        if (tick) {
+          this.lastLodTick = tick;
+          this.lodTickSeq += 1;
+          if (
+            tick.settled &&
+            this.lodSettleMs === null &&
+            this.lodPoseDirtyAt > 0
+          ) {
+            this.lodSettleMs = performance.now() - this.lodPoseDirtyAt;
           }
-        }
-        round.done = done;
-        if (done) {
-          this.finishLodRound(round, false);
         }
         this.currentLod = this.lastLod;
         this.setDirty();
@@ -1553,17 +1529,15 @@ export class SparkRenderer extends THREE.Mesh {
 
   private async updateLodInstances(
     worker: SplatWorker,
-    deltaPred: THREE.Vector3,
     lodMeshes: SplatMesh[],
     maxSplats: number,
     viewPos: THREE.Vector3,
     viewQuat: THREE.Quaternion,
     pixelScaleLimit: number,
-    slice: { budgetMs: number; restart: boolean },
-  ): Promise<{ done: boolean; applied: boolean }> {
-    // Commented out because it makes LoDing less stable
-    // viewPos.add(deltaPred);
-
+    opts: { budgetMs: number; incremental: boolean; hysteresis: number },
+  ): Promise<
+    (LodTickStats & { neededChunks: number; pagePressure: boolean }) | null
+  > {
     const uuidToMesh: Map<string, SplatMesh> = new Map();
     const cameraToWorld = new THREE.Matrix4().compose(
       viewPos,
@@ -1630,43 +1604,49 @@ export class SparkRenderer extends THREE.Mesh {
       pixelScaleLimit,
       lastPixelLimit: this.lastPixelLimit,
       instances,
-      budgetMs: slice.budgetMs,
-      restart: slice.restart,
+      budgetMs: opts.budgetMs,
+      incremental: opts.incremental,
+      hysteresis: opts.hysteresis,
     })) as {
       keyIndices: Record<
         string,
         { lodId: number; numSplats: number; indices: Uint32Array }
-      >;
+      > | null;
       chunks: [number, number][];
       pixelLimit?: number;
+      neededChunks: number;
       done: boolean;
-      slice: number;
-      sliceMs: number;
+      tick?: LodTickStats;
     };
     this.lastTraverseTime = performance.now() - traverseStart;
-
-    const { keyIndices, chunks, pixelLimit, done } = result;
+    const { keyIndices, chunks, pixelLimit, neededChunks } = result;
     this.lastPixelLimit = pixelLimit;
-    const totalLodSplats = Object.values(keyIndices).reduce(
-      (sum, { numSplats }) => sum + numSplats,
-      0,
-    );
+    const totalLodSplats = keyIndices
+      ? Object.values(keyIndices).reduce(
+          (sum, { numSplats }) => sum + numSplats,
+          0,
+        )
+      : (this.lastLodTick?.cutSize ?? 0);
     // console.log(
     //   `traverseLodTrees in ${this.lastTraverseTime} ms, pixelLimit=${pixelLimit}, totalLodSplats=${totalLodSplats}`,
     // );
 
-    // 「不可見的降級」規則(spec §4.5 / lodRound.ts shouldApplySlice):不套的片 GPU 保留上一份 cut。
-    const apply = shouldApplySlice(
-      done,
-      slice.budgetMs,
-      this.lodApplyMinFraction,
-      totalLodSplats,
-      this.lastAppliedSplats,
-    );
-    if (apply) {
-      this.updateLodIndices(uuidToMesh, keyIndices);
-      this.lastAppliedSplats = totalLodSplats;
-      this.lastAppliedChunks = chunks;
+    // GPU 套用:原子一律立刻套;增量依 lodApplyIntervalMs 節流,節流期間只留最新一份
+    if (keyIndices) {
+      const now = performance.now();
+      if (
+        !opts.incremental ||
+        opts.budgetMs <= 0 ||
+        now - this.lodLastApplyAt >= this.lodApplyIntervalMs
+      ) {
+        this.updateLodIndices(uuidToMesh, keyIndices);
+        this.lodLastApplyAt = now;
+        this.lodPendingIndices = null;
+        this.lodPendingUuidToMesh = null;
+      } else {
+        this.lodPendingIndices = keyIndices;
+        this.lodPendingUuidToMesh = uuidToMesh;
+      }
     }
     // console.log("chunks.length =", chunks.length);
 
@@ -1700,24 +1680,13 @@ export class SparkRenderer extends THREE.Mesh {
         chunk: 0,
       }));
 
-      // 不變式(spec §4.5):pager 不能釋放**螢幕上那份 cut** 用到的頁。這片沒套用時螢幕上的
-      // 仍是上一份,所以 fetchPriority = 上一份套用的 chunks(螢幕上的 cut,排最前面)+ 這片的
-      // chunks(新輪的串流,排後面)。SplatPager.driveFetchers 只把前 maxPages 筆標成
-      // needed、其餘視為可釋放 —— 螢幕上的 cut 排前面才能保證 page 池不足時被擠掉的是新輪
-      // 尚未顯示的頁,不是螢幕上的。套用了就只有這片的,與原本相同。
-      const seen = new Set<number>();
-      const lists = apply ? [chunks] : [this.lastAppliedChunks, chunks];
-      for (const list of lists) {
-        for (const [lodId, chunk] of list) {
-          const key = lodId * 2 ** 20 + chunk;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const splats = this.lodIdToSplats.get(lodId);
-          if (splats instanceof PagedSplats) {
-            if (chunk !== 0) {
-              this.pager.fetchPriority.push({ splats, chunk });
-            }
-          }
+      // 不變式(spec §4.5):pager 不能釋放**螢幕上那份 cut** 用到的頁。增量路徑的 `chunks`
+      // 本身就是 needed + wanted 的完整清單(roots 之外的全部);原子路徑的 `chunks` = touched,
+      // 語意同今天。不用再跟上一份套用的 chunks 合併。
+      for (const [lodId, chunk] of chunks) {
+        const splats = this.lodIdToSplats.get(lodId);
+        if (splats instanceof PagedSplats && chunk !== 0) {
+          this.pager.fetchPriority.push({ splats, chunk });
         }
       }
 
@@ -1737,10 +1706,10 @@ export class SparkRenderer extends THREE.Mesh {
         maxSplats: Math.min(this.lodRaycast, Math.round(totalLodSplats * 0.1)),
         pixelScaleLimit,
         instances,
-        // 原子模式:Rust 端在獨立的 scratch core 上跑到底,不碰切片中的 round
-        // (lodRaycast 預設開、每 500ms 一次,若會清掉 round,> 500ms 的 round 永遠跑不完)
+        // 原子模式:Rust 端在獨立的 scratch core 上跑到底,不碰正在累積的增量 cut
+        // (lodRaycast 預設開、每 500ms 一次)
         budgetMs: 0,
-        restart: true,
+        incremental: false,
       })) as {
         keyIndices: Record<
           string,
@@ -1761,21 +1730,8 @@ export class SparkRenderer extends THREE.Mesh {
       }
       // console.log(`raycast traverse in ${raycastTraverseTime} ms, totalRaycastSplats=${totalRaycastSplats}`);
     }
-    return { done, applied: apply };
-  }
-
-  /** 一輪結束(完成或被姿態變動中止):記讀數、推進 lodRoundSeq。 */
-  private finishLodRound(round: LodRound, aborted: boolean) {
-    this.lastLodRound = {
-      firstApplyMs: round.firstApplyMs,
-      totalMs: performance.now() - round.startedAt,
-      slices: round.slice,
-      applied: round.applied,
-      aborted,
-      cause: round.cause,
-      fetchersAtStart: round.fetchersAtStart,
-    };
-    this.lodRoundSeq += 1;
+    const pagePressure = !!this.pager && neededChunks > this.pager.maxPages;
+    return result.tick ? { ...result.tick, neededChunks, pagePressure } : null;
   }
 
   private async cleanupLodTrees(worker: SplatWorker) {

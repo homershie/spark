@@ -1,7 +1,7 @@
 import { ExtSplats, PackedSplats, PagedSplats, SplatMesh, SplatPager } from '.';
 import { SplatAccumulator } from './SplatAccumulator';
 import { SplatWorker } from './SplatWorker';
-import { LodRound, LodRoundStats } from './lodRound';
+import { LodTickStats } from './worker';
 import * as THREE from "three";
 export interface SparkRendererOptions {
     /**
@@ -177,30 +177,18 @@ export interface SparkRendererOptions {
      */
     lodRenderScale?: number;
     /**
-     * LoD traverse 時間切片:每片預算(ms)。每片結束把目前的 cut 套到 GPU,下一幀續跑。
-     * 0 = 關閉(v2.1.0 行為:跑到底才套)。給 40 之類的值會啟用切片,但切片對**走路**(姿態持續
-     * 變動)沒有幫助 —— 每次姿態變都從 root 重開、累積不出完整 cut;它只對「靜止 → 轉頭 → 靜止」
-     * 有效。預設關閉,留作 A/B 與增量式 traverse 的地基。
-     * @default 0
+     * LoD cut 走增量(方案 B):保留上一幀的展開樹、姿態變了只局部拆 / 收,每 tick(一次 worker
+     * 呼叫)交一次合法 cut。false = 每次姿態變動從 root 原子重走(v2.1.0 行為,A/B 對照)。
+     * 設計:spark-react-r3f `docs/superpowers/specs/2026-09-11-incremental-traverse-design.md`。
+     * @default true
      */
-    lodSliceMs?: number;
-    /**
-     * 第一片預算(ms);0 = 同 lodSliceMs。拉長它可壓「轉頭時重疊區先變粗再變細」。
-     * @default 0
-     */
-    lodFirstSliceMs?: number;
-    /**
-     * round 開始後 N ms 內不被姿態變動中止(0 = 一髒就重開)。
-     * @default 0
-     */
-    lodHoldMs?: number;
-    /**
-     * 「不可見的降級」規則:pose/init 輪的中間片只有在「這片的總顆數 ≥ lodApplyMinFraction ×
-     * 螢幕上現有 cut 的總顆數」時才套用;`done` 的那片一律套用;tree 輪(原子)一律套用。
-     * 0 = 每片都套(走路時每輪只活一片 → 永遠是最粗的 cut)。
-     * @default 0.5
-     */
-    lodApplyMinFraction?: number;
+    lodIncremental?: boolean;
+    /** 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。 */
+    lodTickMs?: number;
+    /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
+    lodHysteresis?: number;
+    /** 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。 */
+    lodApplyIntervalMs?: number;
     /**
      * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
      * @default false
@@ -374,29 +362,35 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodSplatCount?: number;
     lodSplatScale: number;
     lodRenderScale: number;
-    /** 切片預算(ms);0 = 關閉(預設,v2.1.0 行為)。切片只對「靜止 → 轉頭 → 靜止」有效,走路情境評估未過,見選項說明。 */
-    lodSliceMs: number;
-    lodFirstSliceMs: number;
-    lodHoldMs: number;
-    lodApplyMinFraction: number;
-    /** 最後一份**真的套到 GPU** 的 cut 的總顆數(shouldApplySlice 的分母)。 */
-    private lastAppliedSplats;
-    /** 那份 cut 回來時的 chunks —— 沒套用的片要把它接在 fetchPriority 後面,螢幕上的頁才不會被 pager 釋放(spec §4.5)。 */
-    private lastAppliedChunks;
-    /** 目前在跑的 round;null = 沒有。cause=pose/init 切片跑;cause=tree 原子一次跑完(相機沒動不閃粗版)。 */
-    lodRound: LodRound | null;
-    /** 頁面更新到了、但要等這輪跑完再補一輪(見 lodRound.ts / driveLod);補的那輪走原子,不切片。 */
-    lodTreeDirty: boolean;
-    /** 每結束一輪(完成或中止)+1;讀數的邊緣訊號。 */
-    lodRoundSeq: number;
-    /** 最近結束的一輪。 */
-    lastLodRound?: LodRoundStats;
     /**
-     * round 開始時算的位移預測(沿用 v2.1.0 的 deltaPred,updateLodInstances 目前沒用它)。
-     * ⚠️ `lastTraverseTime` 現在是**一片**的時間而非整輪,所以這個預測是 slice-scaled ——
-     * 誰要重新啟用 `viewPos.add(deltaPred)` 得先換成整輪的時間。
+     * LoD cut 走增量(方案 B):保留上一幀的展開樹、姿態變了只局部拆 / 收。false = 每次姿態
+     * 變動從 root 原子重走(v2.1.0 行為,A/B 對照)。
      */
-    private lodDeltaPred;
+    lodIncremental: boolean;
+    /** 每 tick 的 wasm 時間預算(ms):掃描 + 拆收,pack 不計。 */
+    lodTickMs: number;
+    /** 拆 / 收的遲滯 ε:拆要 ps > t·(1+ε)、收要 ps ≤ t·(1−ε),壓住門檻邊的閃爍。 */
+    lodHysteresis: number;
+    /** 兩次 GPU 索引套用的最短間隔(ms);0 = 每 tick 套。 */
+    lodApplyIntervalMs: number;
+    /** 最近一次 tick 的讀數;null = 還沒 tick 過。 */
+    lastLodTick: (LodTickStats & {
+        neededChunks: number;
+        pagePressure: boolean;
+    }) | null;
+    /** 每完成一次 tick(`lastLodTick` 被更新)+1;讀數的邊緣訊號。 */
+    lodTickSeq: number;
+    /** 最近一次 pose 髒 → settled 的毫秒;還沒 settled 期間是 null。 */
+    lodSettleMs: number | null;
+    /** 最近一次姿態變髒的 performance.now();用於量測 lodSettleMs。 */
+    private lodPoseDirtyAt;
+    /** 上一次把 lodPendingIndices 套進 GPU 的 performance.now()(節流用)。 */
+    private lodLastApplyAt;
+    /** 被節流延後、還沒套進 GPU 的最新一份索引;下次到期的幀套用。 */
+    private lodPendingIndices;
+    private lodPendingUuidToMesh;
+    /** 頁面更新到了、但要等這次 tick settled 再補一次;見 driveLod。 */
+    lodTreeDirty: boolean;
     lodInflate: boolean;
     pagedExtSplats: boolean;
     maxPagedSplats: number;
@@ -623,8 +617,6 @@ export declare class SparkRenderer extends THREE.Mesh {
     private initLodTree;
     private pageSizeWarning;
     private updateLodInstances;
-    /** 一輪結束(完成或被姿態變動中止):記讀數、推進 lodRoundSeq。 */
-    private finishLodRound;
     private cleanupLodTrees;
     private updateLodIndices;
     private readbackDepth;
