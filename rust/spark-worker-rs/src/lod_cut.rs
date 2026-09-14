@@ -669,8 +669,14 @@ impl IncrementalCut {
         let mut last_collapsed_ps: Option<f32> = None;
         while let Some(&Reverse((OrderedFloat(ps), slot, index))) = self.collapse_heap.peek() {
             let over = self.cut_size > self.max_splats;
-            if !(over || ps <= limit_down) {
-                self.collapse_heap.clear(); // 剩下的 ps 都更大、`over` 對它們同樣不成立(同 expand_heap 的對稱處理)
+            // F1:飽和(cut ≈ max)時走路的死結 —— 收回原本只在「超預算」或「ps ≤ limit·(1−ε)」時
+            // 發生,但 spec §4.5 的穩態定義是「ps ≤ t·(1−ε) 的都收了」,不看有沒有超預算。背後掉出
+            // 視野的候選 ps 會先掉到 `down`(通常遠大於 `limit_down`),不超預算就永遠不會被這裡放行
+            // ——但它已經被掃描階段推進 heap 了(掃描端本來就用 `down`),於是被下面的「都不合格,清空」
+            // 直接丟掉、永遠沒機會收。加回 `ps <= down`,掃描端跟消費端的判準才一致(`t ≥ limit` 恆成立,
+            // 故 `down ≥ limit_down`,兩個條件都留著只是寫清楚,不是必要的邏輯 OR 化簡)。
+            if !(over || ps <= down || ps <= limit_down) {
+                self.collapse_heap.clear(); // 剩下的 ps 都更大、三個條件對它們同樣不成立(同 expand_heap 的對稱處理)
                 break;
             }
             self.collapse_heap.pop();
@@ -1146,5 +1152,33 @@ mod tests {
         let st = cut.tick(&trees, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false);
         assert!(st.scanned > 0 && st.expanded == 0 && st.collapsed == 0 && st.settled && !st.changed);
         assert!(!cut.needs_pack());
+    }
+
+    /// F1:預算飽和(cut ≈ max)時走路。收回原本只在「超預算」或「ps ≤ limit·(1−ε)」時發生——
+    /// 背後掉出視野的候選(ps ≤ t·(1−ε) 但還沒低到 limit·(1−ε))在沒超預算時永遠不會被收,
+    /// 前方新候選一直 Misfit(裝不下)把 t 頂高、預算永遠騰不出來,cut 卡在舊姿態走不到
+    /// 新姿態的原子解。修完之後:收回條件比照 spec §4.5「ps ≤ t·(1−ε) 的都收了」,加上
+    /// `ps <= down` 這個分支,不必超預算也能收。
+    #[test]
+    fn inc_saturated_walk_rebalances() {
+        let (splats, parent) = build_tree();
+        let c2p = [0u32];
+        let limit = 0.03;
+        let max = 30;
+        let pose_a = pose(Vec3A::new(3.0, 0.0, -10.0));
+        let pose_b = pose(Vec3A::new(20.0, 0.0, -10.0));
+
+        let trees_a = views_p(&splats, &c2p, pose_a);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees_a, &[0], limit);
+        settle(&mut cut, &trees_a, max, limit, 0.0);
+        assert_eq!(cut_indices(&cut), atomic_cut(&splats, &pose_a, limit, max));
+        assert_valid(&cut, &parent);
+
+        let trees_b = views_p(&splats, &c2p, pose_b);
+        settle(&mut cut, &trees_b, max, limit, 0.0);
+        assert_eq!(cut_indices(&cut), atomic_cut(&splats, &pose_b, limit, max));
+        assert!(cut.cut_size <= max);
+        assert_valid(&cut, &parent);
     }
 }
