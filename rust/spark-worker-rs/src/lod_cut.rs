@@ -91,6 +91,8 @@ pub(crate) struct TickStats {
     pub(crate) collapsed: u32,
     pub(crate) passes: u32,
     pub(crate) settled: bool,
+    /// `tick()` 本身不 pack,不填這個欄位(Task 4 接 `pack()` 之後才會有值)。
+    #[allow(dead_code)]
     pub(crate) evicted: u32,
     pub(crate) wanted_count: u32,
     pub(crate) cut_size: u32,
@@ -130,6 +132,10 @@ pub(crate) struct IncrementalCut {
     expand_heap: BinaryHeap<(OrderedFloat<f32>, u32, u16, u32)>,
     collapse_heap: BinaryHeap<Reverse<(OrderedFloat<f32>, u32, u32)>>,
     forced: Vec<u32>,
+    /// 掃描 / 拆時每幾筆查一次 deadline(A 的 D4);預設 `DEADLINE_STRIDE`,production 兩處
+    /// (掃描、拆)共用同一個量級。測試用:設成 1 讓注入的 deadline 閉包真的能在任意一步中斷,
+    /// 驗證「切到一半仍是合法 cut」的路徑。
+    pub(crate) deadline_stride: u32,
 }
 
 impl IncrementalCut {
@@ -159,6 +165,7 @@ impl IncrementalCut {
             expand_heap: BinaryHeap::new(),
             collapse_heap: BinaryHeap::new(),
             forced: Vec::new(),
+            deadline_stride: DEADLINE_STRIDE,
         }
     }
 
@@ -317,7 +324,7 @@ impl IncrementalCut {
 
     // ── expand / collapse ───────────────────────────────────────────────────
 
-    /// 把 `slot` 的第 `i` 個孩子(必須是 CUT_LEAF)拆成它的孩子。`ps` 是呼叫端算好的該孩子 ps
+    /// 把 `slot` 的第 `i` 個孩子(必須是 CUT_LEAF 或 CUT_TERMINAL)拆成它的孩子。`ps` 是呼叫端算好的該孩子 ps
     /// (成為新 Node 的 `ps`,也是 `wanted` 的優先序)。
     pub(crate) fn expand(&mut self, trees: &[TreeView], slot: u32, i: u16, ps: f32, max_splats: usize) -> ExpandOutcome {
         let node = self.nodes[slot as usize];
@@ -515,6 +522,222 @@ impl IncrementalCut {
         Chunks { list, roots, needed }
     }
 
+    // ── tick / settled ──────────────────────────────────────────────────────
+
+    /// 穩 = 參數變動之後掃完過一整 pass、最近一整 pass 沒有拆收、沒有候選、預算內。
+    /// ⚠️ `wanted` 非空**不**阻止 settled:頁到了 JS 會因 `lodTreeDirty` 再 tick,頁沒到 tick 也沒事做。
+    pub(crate) fn settled(&self) -> bool {
+        self.visited_since_change >= self.nodes.len() && self.clean_pass
+            && self.expand_heap.is_empty() && self.collapse_heap.is_empty()
+            && self.forced.is_empty() && self.cut_size <= self.max_splats
+    }
+
+    /// 一次 worker 呼叫的工作(spec §4.2)。掃描階段跑到 `scan_deadline`(預算的 60%,免得掃描把
+    /// 時間吃光、拆收永遠輪不到),其餘階段跑到 `deadline`;任一回 true 就停,狀態永遠合法。
+    /// 介面由 spec §4.8 / task brief 指定,參數不可減——同 `lod_tree.rs` 的 `traverse_lod_trees` 先例。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tick(
+        &mut self, trees: &[TreeView], root_pages: &[u32], max_splats: usize, limit: f32, eps: f32,
+        scan_deadline: &mut impl FnMut() -> bool, deadline: &mut impl FnMut() -> bool,
+    ) -> TickStats {
+        let ids: Vec<u32> = trees.iter().map(|t| t.lod_id).collect();
+        if ids != self.lod_ids || self.nodes.is_empty() {
+            self.restart(trees, root_pages, limit);
+        }
+        let params: Vec<InstanceParams> = trees.iter().map(|t| t.params).collect();
+        if params != self.params || max_splats != self.max_splats || limit != self.limit {
+            self.params = params;
+            self.visited_since_change = 0;
+            self.clean_pass = false;
+        }
+        self.max_splats = max_splats;
+        self.limit = limit;
+        if self.t < limit {
+            self.t = limit;
+        }
+        let gen0 = self.generation;
+        let mut st = TickStats::default();
+        let up = self.t * (1.0 + eps);
+        let down = self.t * (1.0 - eps);
+        let limit_down = limit * (1.0 - eps);
+
+        // ── 1. 掃描切片(最多一整 pass)──
+        // over_budget:超預算時,收候選不能只靠 ps 掉到門檻以下才進 heap(D20「超預算從 ps 最小的收」)——
+        // 否則相機不動、每個節點的 ps 都穩穩高於門檻,收 heap 永遠是空的,`max_splats` 被外部調低後永遠收不回來
+        // (下面消費端雖有 `over` 快速通關,但沒有候選可 pop 一樣無效)。這裡用 tick 開始時的 cut_size 判斷一次即可:
+        // 掃描階段不改動 cut_size,直到步驟 2/3 才會變。
+        let over_budget = self.cut_size > self.max_splats;
+        let n = self.nodes.len();
+        let mut checks = 0u32;
+        let mut stopped = false;
+        for _ in 0..n {
+            if self.cursor >= n {
+                self.cursor = 0;
+                self.passes += 1;
+                self.clean_pass = self.generation == self.pass_start_generation;
+                self.pass_start_generation = self.generation;
+            }
+            let slot = self.cursor as u32;
+            self.cursor += 1;
+            self.visited_since_change += 1;
+            checks += 1;
+            if checks % self.deadline_stride == 0 && scan_deadline() {
+                break; // 掃描配額用完;拆收仍有自己的時間
+            }
+            let node = self.nodes[slot as usize];
+            if !node.alive {
+                continue;
+            }
+            st.scanned += 1;
+            let p = &trees[node.inst as usize].params;
+            let node_ps = if node.parent == NONE { f32::INFINITY } else { Self::ps_of(node.center, node.size, p) };
+            self.nodes[slot as usize].ps = node_ps;
+            // 2a. 階層上界(spec D18):整組孩子的 ps 不可能超過
+            //     lod_scale · child_size_max / max(dist − radius, ε)(foveate ≤ 1),
+            //     ≤ 拆門檻就整組跳過 —— 遠場幾乎全中,掃描省 5/6 的算術。虛擬根不跳(radius 0、只有 root)。
+            let base = node.children_base as usize;
+            let skip_children = if node.parent == NONE {
+                false
+            } else {
+                let d = (Vec3A::from_array(node.center.map(|x| x.to_f32())) - p.origin).length();
+                let ps_max = p.lod_scale * node.child_size_max.to_f32() / (d - node.radius.to_f32()).max(1.0e-6);
+                ps_max <= up
+            };
+            if !skip_children {
+                for i in 0..node.child_count as usize {
+                    let c = self.arena[base + i];
+                    if c.slot != CUT_LEAF {
+                        continue;
+                    }
+                    let ps = Self::ps_of(c.center, c.size, p);
+                    if ps > up {
+                        self.expand_heap.push((OrderedFloat(ps), slot, i as u16, node.index));
+                    }
+                }
+            }
+            if node.parent != NONE && node.expanded == 0 && (node_ps <= down || node_ps <= limit_down || over_budget) {
+                self.collapse_heap.push(Reverse((OrderedFloat(node_ps), slot, node.index)));
+            }
+        }
+        // 掃完整 pass 但 pass 內有變動 → clean_pass 已由上面設;若這 tick 一路掃到 n 又沒 wrap
+        // (cursor == n),下一 tick 開頭會 wrap 並結算。
+
+        // ── 2. 收:forced(頁被踢)無條件;候選在「超預算」或「ps ≤ limit」時 ──
+        let forced = std::mem::take(&mut self.forced);
+        for slot in forced {
+            let node = self.nodes[slot as usize];
+            if node.alive && node.forced {
+                self.nodes[slot as usize].forced = false;
+                if self.collapse(trees, slot) {
+                    st.collapsed += 1;
+                } else {
+                    // 收不了(parent 不 resident 或有孩子展開):留著,下次 pack 再標
+                }
+            }
+        }
+        let mut last_collapsed_ps: Option<f32> = None;
+        while let Some(&Reverse((OrderedFloat(ps), slot, index))) = self.collapse_heap.peek() {
+            let over = self.cut_size > self.max_splats;
+            if !(over || ps <= limit_down) {
+                self.collapse_heap.clear(); // 剩下的 ps 都更大、`over` 對它們同樣不成立(同 expand_heap 的對稱處理)
+                break;
+            }
+            self.collapse_heap.pop();
+            let node = self.nodes[slot as usize];
+            if !node.alive || node.index != index || node.expanded != 0 {
+                continue; // lazy:候選過期
+            }
+            if self.collapse(trees, slot) {
+                st.collapsed += 1;
+                if over {
+                    last_collapsed_ps = Some(ps);
+                }
+                // 連收多層:parent 可能因此成為候選
+                let parent = self.nodes[node.parent as usize];
+                if parent.parent != NONE && parent.expanded == 0 {
+                    let pps = Self::ps_of(parent.center, parent.size, &trees[parent.inst as usize].params);
+                    self.nodes[node.parent as usize].ps = pps;
+                    if pps <= down || pps <= limit_down {
+                        self.collapse_heap.push(Reverse((OrderedFloat(pps), node.parent, parent.index)));
+                    }
+                }
+            }
+            if deadline() {
+                stopped = true;
+                break;
+            }
+        }
+        if let Some(ps) = last_collapsed_ps {
+            self.t = self.t.max(ps);
+        }
+
+        // ── 3. 拆:ps 由大到小,裝得下、resident、時間沒到 ──
+        let mut misfit_ps: Option<f32> = None;
+        let mut expansions = 0u32;
+        if !stopped {
+            let up_now = self.t * (1.0 + eps);
+            while let Some(&(OrderedFloat(ps), slot, i, index)) = self.expand_heap.peek() {
+                if ps <= up_now {
+                    self.expand_heap.clear(); // 剩下的都更小
+                    break;
+                }
+                self.expand_heap.pop();
+                let node = self.nodes[slot as usize];
+                if !node.alive || node.index != index || self.arena[(node.children_base + i as u32) as usize].slot != CUT_LEAF {
+                    continue; // lazy:候選過期
+                }
+                match self.expand(trees, slot, i, ps, self.max_splats) {
+                    ExpandOutcome::Expanded(new_slot) => {
+                        st.expanded += 1;
+                        let nn = self.nodes[new_slot as usize];
+                        let p = &trees[nn.inst as usize].params;
+                        for g in 0..nn.child_count as usize {
+                            let c = self.arena[nn.children_base as usize + g];
+                            if c.slot == CUT_LEAF {
+                                let cps = Self::ps_of(c.center, c.size, p);
+                                if cps > up_now {
+                                    self.expand_heap.push((OrderedFloat(cps), new_slot, g as u16, nn.index));
+                                }
+                            }
+                        }
+                    }
+                    ExpandOutcome::Misfit(_) => {
+                        misfit_ps = Some(ps);
+                        self.expand_heap.clear();
+                        break;
+                    }
+                    ExpandOutcome::NotResident | ExpandOutcome::Terminal => {}
+                }
+                expansions += 1;
+                if expansions % self.deadline_stride == 0 && deadline() {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+
+        // ── 4. 門檻控制器(spec §4.5)──
+        if let Some(ps) = misfit_ps {
+            self.t = ps;
+        } else if !stopped && self.expand_heap.is_empty() && self.t > limit
+            && (self.cut_size as f32) < 0.98 * self.max_splats as f32
+        {
+            self.t = (self.t * 0.9).max(limit);
+        }
+        if self.t < limit {
+            self.t = limit;
+        }
+
+        st.passes = self.passes;
+        st.settled = self.settled();
+        st.wanted_count = self.wanted.len() as u32;
+        st.cut_size = self.cut_size as u32;
+        st.t = self.t;
+        st.arena_leaked = self.arena_leaked;
+        st.changed = self.generation != gen0;
+        st
+    }
+
     /// 測試用:cut 的 (inst, chunk-space index) 集合。
     #[cfg(test)]
     pub(crate) fn cut_set_for_test(&self) -> Vec<(u8, u32)> {
@@ -687,5 +910,188 @@ mod tests {
         assert_eq!(chunks.roots, 1);
         assert_eq!(chunks.needed, 0, "cut 全在 chunk 0 = root chunk,已在 roots 段、needed 不重複列");
         assert_eq!(chunks.list, vec![(LOD_ID, 0), (LOD_ID, 1)]);
+    }
+
+    /// 原子參考:從 root best-first 展開到底(與 expand_until 同語意),回 chunk-space cut。
+    fn atomic_cut(splats: &[LodSplat], p: &InstanceParams, limit: f32, max: usize) -> Vec<u32> {
+        let mut heap: BinaryHeap<(OrderedFloat<f32>, u32)> = BinaryHeap::new();
+        let mut out = Vec::new();
+        let mut n = 1usize;
+        heap.push((OrderedFloat(crate::lod_traverse::compute_pixel_scale(&splats[0], p)), 0));
+        while let Some(&(OrderedFloat(ps), node)) = heap.peek() {
+            if ps <= limit { break; }
+            let LodSplat { child_count, child_start, .. } = splats[node as usize];
+            if child_count == 0 { heap.pop(); out.push(node); continue; }
+            if n - 1 + child_count as usize > max { break; }
+            heap.pop();
+            for c in child_start..child_start + child_count as u32 {
+                heap.push((OrderedFloat(crate::lod_traverse::compute_pixel_scale(&splats[c as usize], p)), c));
+            }
+            n = n - 1 + child_count as usize;
+        }
+        out.extend(heap.into_iter().map(|(_, node)| node));
+        out.sort_unstable();
+        out
+    }
+
+    fn pose(origin: Vec3A) -> InstanceParams {
+        InstanceParams { origin, ..params() }
+    }
+
+    /// tick 到 settled(無 deadline),回 tick 數;超過 50 tick 視為不收斂。
+    fn settle(cut: &mut IncrementalCut, trees: &[TreeView], max: usize, limit: f32, eps: f32) -> u32 {
+        for k in 1..=50 {
+            let st = cut.tick(trees, &[0], max, limit, eps, &mut || false, &mut || false);
+            if st.settled { return k; }
+        }
+        panic!("50 tick 未 settled:cut_size {} t {}", cut.cut_size, cut.t);
+    }
+
+    fn views_p<'a>(splats: &'a [LodSplat], c2p: &'a [u32], p: InstanceParams) -> Vec<TreeView<'a>> {
+        vec![TreeView { lod_id: LOD_ID, splats, chunk_to_page: c2p, params: p }]
+    }
+
+    /// 姿態鏈(handoff 試作的三個情境合一):全 L2(站 1、6)/ 全 L1(站 3)/ 兩種混合(站 0、2、4、5);
+    /// 每站 == 原子;eps = 0 才逐位相等。limit=0.03999 之下 L2 的 ps 在這條鏈上從未超過門檻
+    /// (z=-50 時最大 ≈0.0398),所以鏈上能到達的最細層是 L2、不是樹葉 21..=84(原子參考同樣停在 L2)。
+    #[test]
+    fn inc_equals_atomic_limit_only() {
+        let (splats, parent) = build_tree();
+        let c2p = [0u32];
+        let limit = 0.03999;
+        let chain = [
+            Vec3A::new(0.0, 0.0, -100.0), Vec3A::new(0.0, 0.0, -50.0), Vec3A::new(5.0, 0.0, -100.0),
+            Vec3A::new(0.0, 0.0, -150.0), Vec3A::new(0.0, 0.0, -100.0), Vec3A::new(5.0, 0.0, -100.0),
+            Vec3A::new(0.0, 0.0, -50.0),
+        ];
+        let mut cut = IncrementalCut::new();
+        let mut distinct = AHashSet::new();
+        for (k, &o) in chain.iter().enumerate() {
+            let p = pose(o);
+            let trees = views_p(&splats, &c2p, p);
+            if k == 0 { cut.restart(&trees, &[0], limit); }
+            let ticks = settle(&mut cut, &trees, 1000, limit, 0.0);
+            assert!(ticks <= 6, "站 {k} 用了 {ticks} tick");
+            assert_eq!(cut_indices(&cut), atomic_cut(&splats, &p, limit, 1000), "站 {k} origin={o:?}");
+            assert_valid(&cut, &parent);
+            distinct.insert(cut_indices(&cut));
+        }
+        assert_eq!(distinct.len(), 4);
+        assert_eq!(cut_indices(&cut), (5..=20).collect::<Vec<_>>());
+    }
+
+    /// 預算:64 葉 → 30 收 12 組 == 原子;4 個 L1 → 30 拆到 28 == 原子(等步長樹,handoff 註)。
+    #[test]
+    fn inc_equals_atomic_with_budget() {
+        let (splats, parent) = build_tree();
+        let c2p = [0u32];
+        let limit = 0.03;
+        let near = pose(Vec3A::new(3.0, 0.0, -50.0));
+        let far = pose(Vec3A::new(0.0, 0.0, -150.0));
+        let atomic = atomic_cut(&splats, &near, limit, 30);
+        assert_eq!(atomic.len(), 28);
+
+        let trees = views_p(&splats, &c2p, near);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], limit);
+        settle(&mut cut, &trees, 1000, limit, 0.0);
+        assert_eq!(cut.cut_size, 64);
+        settle(&mut cut, &trees, 30, limit, 0.0);          // 預算縮到 30:收
+        assert_eq!(cut_indices(&cut), atomic);
+        assert_valid(&cut, &parent);
+
+        let trees_far = views_p(&splats, &c2p, far);
+        settle(&mut cut, &trees_far, 1000, limit, 0.0);   // 拉遠:4 個 L1
+        assert_eq!(cut_indices(&cut), vec![1, 2, 3, 4]);
+        settle(&mut cut, &trees, 30, limit, 0.0);         // 拉近 + 預算 30:拆到 28
+        assert_eq!(cut_indices(&cut), atomic);
+        assert_valid(&cut, &parent);
+    }
+
+    /// deadline 每筆就停:每個 tick 之後都是合法 cut、不超預算,最終仍收斂到原子。
+    #[test]
+    fn inc_every_tick_is_valid_cut() {
+        let (splats, parent) = build_tree();
+        let c2p = [0u32];
+        let limit = 0.03;
+        let p = pose(Vec3A::new(3.0, 0.0, -50.0));
+        let trees = views_p(&splats, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], limit);
+        cut.deadline_stride = 1; // 讓注入的 deadline 閉包真的每一步都能咬到,而不是要等 64/4096 筆
+        let mut ticks = 0;
+        loop {
+            // 兩個 deadline 閉包共用一個計數:用 Cell,否則兩個 &mut 閉包同時借 n 會 E0499
+            let n = std::cell::Cell::new(0u32);
+            let stop = || { n.set(n.get() + 1); n.get() > 1 };
+            let st = cut.tick(&trees, &[0], 30, limit, 0.0, &mut || stop(), &mut || stop());
+            ticks += 1;
+            assert_valid(&cut, &parent);
+            assert!(cut.cut_size <= 30);
+            if st.settled { break; }
+            assert!(ticks < 500, "不收斂");
+        }
+        assert!(ticks > 5, "每筆就停,應該要很多 tick:{ticks}");
+        assert_eq!(cut_indices(&cut), atomic_cut(&splats, &p, limit, 30));
+    }
+
+    /// 遲滯:z=-100、limit 0.04 時 L1 的 ps ≈ 0.0399(貼著門檻)。先在 limit 0.03 建到 L2,
+    /// 換 limit 0.04:eps 0.15 → 不收(0.0399 > 0.034);eps 0 → 收回 L1。
+    #[test]
+    fn inc_hysteresis_prevents_flip() {
+        let (splats, _) = build_tree();
+        let c2p = [0u32];
+        let p = pose(Vec3A::new(0.0, 0.0, -100.0));
+        let trees = views_p(&splats, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        assert_eq!(cut_indices(&cut), (5..=20).collect::<Vec<_>>());
+        for _ in 0..20 {
+            let st = cut.tick(&trees, &[0], 1000, 0.04, 0.15, &mut || false, &mut || false);
+            assert_eq!((st.expanded, st.collapsed), (0, 0));
+        }
+        assert_eq!(cut_indices(&cut), (5..=20).collect::<Vec<_>>(), "遲滯內不該動");
+        settle(&mut cut, &trees, 1000, 0.04, 0.0);
+        assert_eq!(cut_indices(&cut), vec![1, 2, 3, 4]);
+    }
+
+    /// D18 的上界是保守的:同一姿態鏈,開上界跳過與不開結果相同。
+    /// 「不跳」的版本靠把每個 Node 的 radius 改成 f16::MAX 模擬 —— `dist − radius` 變負、被 `max(1e-6)`
+    /// 夾住,ps_max 變成天文數字、`ps_max <= up` 永遠不成立 → 每組孩子都算。
+    #[test]
+    fn inc_hierarchical_bound_never_skips_needed_expansion() {
+        let (splats, _) = build_tree();
+        let c2p = [0u32];
+        let limit = 0.03999;
+        let chain = [Vec3A::new(0.0, 0.0, -100.0), Vec3A::new(0.0, 0.0, -50.0), Vec3A::new(5.0, 0.0, -100.0), Vec3A::new(0.0, 0.0, -150.0), Vec3A::new(0.0, 0.0, -100.0)];
+        let mut with = IncrementalCut::new();
+        let mut without = IncrementalCut::new();
+        for (k, &o) in chain.iter().enumerate() {
+            let trees = views_p(&splats, &c2p, pose(o));
+            if k == 0 { with.restart(&trees, &[0], limit); without.restart(&trees, &[0], limit); }
+            settle(&mut with, &trees, 1000, limit, 0.15);
+            for n in without.nodes.iter_mut() { n.radius = f16::MAX; }
+            settle(&mut without, &trees, 1000, limit, 0.15);
+            assert_eq!(cut_indices(&with), cut_indices(&without), "站 {k}");
+            let skipped = with.tick(&trees, &[0], 1000, limit, 0.15, &mut || false, &mut || false).scanned;
+            assert!(skipped > 0);
+        }
+    }
+
+    /// 穩了之後再 tick:有掃、沒拆收、settled、不需要 pack。
+    #[test]
+    fn inc_settled_stops() {
+        let (splats, _) = build_tree();
+        let c2p = [0u32];
+        let p = pose(Vec3A::new(0.0, 0.0, -50.0));
+        let trees = views_p(&splats, &c2p, p);
+        let mut cut = IncrementalCut::new();
+        cut.restart(&trees, &[0], 0.03);
+        settle(&mut cut, &trees, 1000, 0.03, 0.0);
+        cut.pack(&trees);
+        let st = cut.tick(&trees, &[0], 1000, 0.03, 0.0, &mut || false, &mut || false);
+        assert!(st.scanned > 0 && st.expanded == 0 && st.collapsed == 0 && st.settled && !st.changed);
+        assert!(!cut.needs_pack());
     }
 }
