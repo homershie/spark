@@ -94,6 +94,8 @@ pub(crate) struct TickStats {
     /// `tick()` 本身不 pack,不填這個欄位(Task 4 接 `pack()` 之後才會有值)。
     #[allow(dead_code)]
     pub(crate) evicted: u32,
+    /// 這個 tick 被 D18 階層上界跳過的兄弟組數(spec D18)。
+    pub(crate) bound_skipped: u32,
     pub(crate) wanted_count: u32,
     pub(crate) cut_size: u32,
     pub(crate) t: f32,
@@ -121,12 +123,14 @@ pub(crate) struct IncrementalCut {
     pub(crate) generation: u64,
     packed_generation: u64,
     cursor: usize,
-    /// 上次 tick 的姿態 / 參數;變了就把「這一 pass 已掃過的」歸零(settled 要求變動後掃完一整 pass)。
+    /// 上次 tick 的姿態 / 參數;變了就把「已訪問筆數」歸零(settled 要求變動後掃完一整 pass)。
     params: Vec<InstanceParams>,
+    /// 自「上一次會讓集合失效的變動」以來,掃描訪問過幾個 slot(含死 slot)。settled 要求
+    /// `>= nodes.len()`,即至少完整掃過一輪 ——「變動」涵蓋 params/max/limit 改變(tick 開頭偵測)、
+    /// 這個 tick 有 expand/collapse 發生(generation 變了)、`t` 被門檻控制器改動(misfit / 收後上調 /
+    /// 0.9 衰減 / 下限夾住)三類,見 tick() 尾端。不再用「clean pass」(整段 pass 內 generation 不變)
+    /// 這種定義 —— 它的 wrap 時機恰好落在下一 tick 開頭,容易被剛設的 `= false` 蓋掉,見 C2。
     visited_since_change: usize,
-    /// 這一 pass 開始時的 generation;pass 走完沒變 = clean pass(settled 的條件之一)。
-    pass_start_generation: u64,
-    clean_pass: bool,
     passes: u32,
     /// (ps, node slot, child i, node.index 驗證用)—— 跨 tick 保留,pop 時驗證。
     expand_heap: BinaryHeap<(OrderedFloat<f32>, u32, u16, u32)>,
@@ -136,6 +140,12 @@ pub(crate) struct IncrementalCut {
     /// (掃描、拆)共用同一個量級。測試用:設成 1 讓注入的 deadline 閉包真的能在任意一步中斷,
     /// 驗證「切到一半仍是合法 cut」的路徑。
     pub(crate) deadline_stride: u32,
+    /// 門檻控制器的「已確認裝不下」旗標(不在原 spec §4.5 的四條規則裡,是 C2 改完 settled() 之後
+    /// 補的第五條,見 tick() 內註解):misfit 把它設 true,之後 0.9 衰減規則暫停,直到真的有 collapse
+    /// 騰出預算(或 params/max/limit 變動)才清掉。沒有它,misfit 剛把 t 頂上去、下一輪衰減規則馬上
+    /// 又把它壓下來、同一個候選立刻又 misfit——t 永遠在兩個值之間跳,`visited_since_change` 每 tick
+    /// 都被 C2 的「t 變了就歸零」重置,`settled()` 永遠不會真。
+    misfit_pinned: bool,
 }
 
 impl IncrementalCut {
@@ -159,13 +169,12 @@ impl IncrementalCut {
             cursor: 0,
             params: Vec::new(),
             visited_since_change: 0,
-            pass_start_generation: 0,
-            clean_pass: false,
             passes: 0,
             expand_heap: BinaryHeap::new(),
             collapse_heap: BinaryHeap::new(),
             forced: Vec::new(),
             deadline_stride: DEADLINE_STRIDE,
+            misfit_pinned: false,
         }
     }
 
@@ -284,11 +293,10 @@ impl IncrementalCut {
         self.t = limit;
         self.generation += 1;
         self.cursor = 0;
-        self.pass_start_generation = self.generation;
-        self.clean_pass = false;
         self.expand_heap.clear();
         self.collapse_heap.clear();
         self.forced.clear();
+        self.misfit_pinned = false;
 
         for (inst, tree) in trees.iter().enumerate() {
             // v2.1.0 慣例:root page 未知就當 page 0(seed_roots 同)
@@ -524,10 +532,12 @@ impl IncrementalCut {
 
     // ── tick / settled ──────────────────────────────────────────────────────
 
-    /// 穩 = 參數變動之後掃完過一整 pass、最近一整 pass 沒有拆收、沒有候選、預算內。
+    /// 穩 = 自上次會讓集合失效的變動以來,已完整掃過一輪(`visited_since_change >= nodes.len()`,
+    /// 見該欄位的說明——tick() 尾端在三種情況下把它歸零:generation 變了、`t` 被控制器改了、或這個 tick
+    /// 開頭偵測到 params/max/limit 變了)、沒有候選、預算內。
     /// ⚠️ `wanted` 非空**不**阻止 settled:頁到了 JS 會因 `lodTreeDirty` 再 tick,頁沒到 tick 也沒事做。
     pub(crate) fn settled(&self) -> bool {
-        self.visited_since_change >= self.nodes.len() && self.clean_pass
+        self.visited_since_change >= self.nodes.len()
             && self.expand_heap.is_empty() && self.collapse_heap.is_empty()
             && self.forced.is_empty() && self.cut_size <= self.max_splats
     }
@@ -540,6 +550,8 @@ impl IncrementalCut {
         &mut self, trees: &[TreeView], root_pages: &[u32], max_splats: usize, limit: f32, eps: f32,
         scan_deadline: &mut impl FnMut() -> bool, deadline: &mut impl FnMut() -> bool,
     ) -> TickStats {
+        // M2:gen0 要在可能的 restart() 之前取,restart 本身也讓 generation +1,才會被算進 `changed`。
+        let gen0 = self.generation;
         let ids: Vec<u32> = trees.iter().map(|t| t.lod_id).collect();
         if ids != self.lod_ids || self.nodes.is_empty() {
             self.restart(trees, root_pages, limit);
@@ -548,14 +560,23 @@ impl IncrementalCut {
         if params != self.params || max_splats != self.max_splats || limit != self.limit {
             self.params = params;
             self.visited_since_change = 0;
-            self.clean_pass = false;
+            // M5:params/max/limit 變了,heap 裡按舊門檻排的候選(ps 與其優先序)全部作廢,清掉
+            // 免得之後用舊 ps 誤判(消費端不會重算 heap 裡存的 ps)。
+            self.expand_heap.clear();
+            self.collapse_heap.clear();
+            // 同理:之前 misfit 頂住的「已確認裝不下」對新的 params/max/limit 不再有意義
+            // (尤其是 max_splats 變大——原本裝不下的,現在可能裝得下,該讓衰減重新探)。
+            self.misfit_pinned = false;
         }
         self.max_splats = max_splats;
         self.limit = limit;
         if self.t < limit {
             self.t = limit;
         }
-        let gen0 = self.generation;
+        // C2:t0 記這個 tick 實際要用的門檻(上面的下限夾住之後),tick 尾端跟最終值比對,
+        // `t` 被控制器動過(misfit / 收後上調 / 0.9 衰減 / 再夾一次下限)就把 visited_since_change 歸零——
+        // 那些用舊門檻掃出來的「已訪問」不再代表這輪的候選集合是完整的。
+        let t0 = self.t;
         let mut st = TickStats::default();
         let up = self.t * (1.0 + eps);
         let down = self.t * (1.0 - eps);
@@ -571,19 +592,21 @@ impl IncrementalCut {
         let mut checks = 0u32;
         let mut stopped = false;
         for _ in 0..n {
-            if self.cursor >= n {
-                self.cursor = 0;
-                self.passes += 1;
-                self.clean_pass = self.generation == self.pass_start_generation;
-                self.pass_start_generation = self.generation;
-            }
-            let slot = self.cursor as u32;
-            self.cursor += 1;
-            self.visited_since_change += 1;
+            // C1:deadline 檢查移到讀 / 前進 cursor 之前 —— 一旦這裡中斷,這個 slot 還沒被讀取,
+            // cursor 也還沒往前、`visited_since_change` 也還沒 +1(不能算「訪問過」)。原本的順序
+            // 是讀完、前進完、算完訪問數才查 deadline,中斷點會把「還沒真的掃到的那個 slot」算成
+            // 已訪問 ——兩個連續 tick 都卡在 deadline 上就會出現 `scanned=0` 卻 `settled=true`。
             checks += 1;
             if checks % self.deadline_stride == 0 && scan_deadline() {
                 break; // 掃描配額用完;拆收仍有自己的時間
             }
+            if self.cursor >= n {
+                self.cursor = 0;
+                self.passes += 1;
+            }
+            let slot = self.cursor as u32;
+            self.cursor += 1;
+            self.visited_since_change += 1;
             let node = self.nodes[slot as usize];
             if !node.alive {
                 continue;
@@ -593,14 +616,17 @@ impl IncrementalCut {
             let node_ps = if node.parent == NONE { f32::INFINITY } else { Self::ps_of(node.center, node.size, p) };
             self.nodes[slot as usize].ps = node_ps;
             // 2a. 階層上界(spec D18):整組孩子的 ps 不可能超過
-            //     lod_scale · child_size_max / max(dist − radius, ε)(foveate ≤ 1),
+            //     lod_scale · child_size_max · fov_max / max(dist − radius, ε),
             //     ≤ 拆門檻就整組跳過 —— 遠場幾乎全中,掃描省 5/6 的算術。虛擬根不跳(radius 0、只有 root)。
+            //     M6:fov_max 取 `behind_foveate`/`cone_foveate` 與 1.0 的最大值(原本假設 foveate ≤ 1,
+            //     若有人把場景設成 foveate > 1,這裡不跟著放大上界就不再保守)。
             let base = node.children_base as usize;
             let skip_children = if node.parent == NONE {
                 false
             } else {
                 let d = (Vec3A::from_array(node.center.map(|x| x.to_f32())) - p.origin).length();
-                let ps_max = p.lod_scale * node.child_size_max.to_f32() / (d - node.radius.to_f32()).max(1.0e-6);
+                let fov_max = p.behind_foveate.max(p.cone_foveate).max(1.0);
+                let ps_max = p.lod_scale * node.child_size_max.to_f32() * fov_max / (d - node.radius.to_f32()).max(1.0e-6);
                 ps_max <= up
             };
             if !skip_children {
@@ -614,13 +640,16 @@ impl IncrementalCut {
                         self.expand_heap.push((OrderedFloat(ps), slot, i as u16, node.index));
                     }
                 }
+            } else {
+                st.bound_skipped += 1;
             }
             if node.parent != NONE && node.expanded == 0 && (node_ps <= down || node_ps <= limit_down || over_budget) {
                 self.collapse_heap.push(Reverse((OrderedFloat(node_ps), slot, node.index)));
             }
         }
-        // 掃完整 pass 但 pass 內有變動 → clean_pass 已由上面設;若這 tick 一路掃到 n 又沒 wrap
-        // (cursor == n),下一 tick 開頭會 wrap 並結算。
+        // 掃到 n 筆但沒 wrap(cursor == n)的話,下一 tick 開頭才會真正 wrap、bump `passes`。
+        // 「這一輪掃完了沒」現在完全交給 `visited_since_change >= nodes.len()` 判斷(見該欄位/`settled()`),
+        // 不再靠這裡的 wrap 時機順便判一次 clean pass。
 
         // ── 2. 收:forced(頁被踢)無條件;候選在「超預算」或「ps ≤ limit」時 ──
         let forced = std::mem::take(&mut self.forced);
@@ -631,7 +660,9 @@ impl IncrementalCut {
                 if self.collapse(trees, slot) {
                     st.collapsed += 1;
                 } else {
-                    // 收不了(parent 不 resident 或有孩子展開):留著,下次 pack 再標
+                    // 收不了(這個 slot 自己的 chunk 不 resident,或它又有孩子被展開了):上面兩行已經把
+                    // 它從 forced 名單移除、`forced` flag 也清掉了,這裡不用也不會再留著它 —— 下次 pack()
+                    // 若仍發現它被 evicted,會重新標 forced、重新進名單,下一 tick 再收一次。
                 }
             }
         }
@@ -652,12 +683,13 @@ impl IncrementalCut {
                 if over {
                     last_collapsed_ps = Some(ps);
                 }
-                // 連收多層:parent 可能因此成為候選
+                // 連收多層:parent 可能因此成為候選。M1:超預算時也要推(同 D20,不能只靠 ps 掉到門檻以下),
+                // 用剛收完之後的最新 cut_size(collapse() 內已經減過)判斷。
                 let parent = self.nodes[node.parent as usize];
                 if parent.parent != NONE && parent.expanded == 0 {
                     let pps = Self::ps_of(parent.center, parent.size, &trees[parent.inst as usize].params);
                     self.nodes[node.parent as usize].ps = pps;
-                    if pps <= down || pps <= limit_down {
+                    if pps <= down || pps <= limit_down || self.cut_size > self.max_splats {
                         self.collapse_heap.push(Reverse((OrderedFloat(pps), node.parent, parent.index)));
                     }
                 }
@@ -716,16 +748,32 @@ impl IncrementalCut {
             }
         }
 
-        // ── 4. 門檻控制器(spec §4.5)──
+        // ── 4. 門檻控制器(spec §4.5 + misfit_pinned,見該欄位註解)──
+        // 這個 tick 若真的收掉過東西,騰出的預算讓「之前 misfit 過」這件事不再可靠,解除釘住、
+        // 讓衰減規則有機會重新探。（只有「真的 collapse 過」算數——單純 expand 是在消耗預算,
+        // 不會讓 misfit 的結論過期,不清。）
+        if st.collapsed > 0 {
+            self.misfit_pinned = false;
+        }
         if let Some(ps) = misfit_ps {
             self.t = ps;
+            self.misfit_pinned = true;
         } else if !stopped && self.expand_heap.is_empty() && self.t > limit
             && (self.cut_size as f32) < 0.98 * self.max_splats as f32
+            && !self.misfit_pinned
         {
             self.t = (self.t * 0.9).max(limit);
         }
         if self.t < limit {
             self.t = limit;
+        }
+
+        // C2:這個 tick 若讓集合失效(拆/收發生過,generation 變了;或門檻 `t` 被控制器改了 ——
+        // misfit / 收後上調 / 0.9 衰減 / 剛剛這次下限夾住),`visited_since_change` 歸零:
+        // 這個 tick 掃描累積的「已訪問」是用舊集合 / 舊門檻掃的,不能代表新狀態下已經掃完一輪。
+        let changed = self.generation != gen0;
+        if changed || self.t != t0 {
+            self.visited_since_change = 0;
         }
 
         st.passes = self.passes;
@@ -734,7 +782,7 @@ impl IncrementalCut {
         st.cut_size = self.cut_size as u32;
         st.t = self.t;
         st.arena_leaked = self.arena_leaked;
-        st.changed = self.generation != gen0;
+        st.changed = changed;
         st
     }
 
@@ -1074,8 +1122,13 @@ mod tests {
             for n in without.nodes.iter_mut() { n.radius = f16::MAX; }
             settle(&mut without, &trees, 1000, limit, 0.15);
             assert_eq!(cut_indices(&with), cut_indices(&without), "站 {k}");
-            let skipped = with.tick(&trees, &[0], 1000, limit, 0.15, &mut || false, &mut || false).scanned;
-            assert!(skipped > 0);
+            let st = with.tick(&trees, &[0], 1000, limit, 0.15, &mut || false, &mut || false);
+            if k == 3 {
+                // 遠站(z=-150):root 對 4 個 L1 孩子的階層上界(≈0.0274)遠低於 up(0.03999×1.15≈0.046),
+                // 這組孩子理應被整組跳過 —— 用真正的 `bound_skipped` 計數驗證跳過真的發生了,
+                // 不再用先前那個「任何 tick 都必然 > 0」的 `scanned` 湊數。
+                assert!(st.bound_skipped > 0, "遠站(z=-150)應該有階層上界跳過,bound_skipped={}", st.bound_skipped);
+            }
         }
     }
 
