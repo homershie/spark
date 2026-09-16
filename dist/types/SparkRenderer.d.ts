@@ -196,6 +196,20 @@ export interface SparkRendererOptions {
      */
     lodApplyIntervalMs?: number;
     /**
+     * 「只重排序、不重建」快路徑(`src/depthOnly.ts`):相機動了但 accumulator 內容沒變
+     * (version / mapping 都相同)時,不重跑每顆 mesh 的 generate pass,只用一個 depth-only pass
+     * 從已生好的 packed 中心重算排序鍵(`SplatAccumulator.regenerateDepth`)。這個值是**非 ext
+     * 模式**(`accumExtSplats: false`,預設)允許相機離開生成原點的最大距離(世界單位):packed
+     * 中心是相對生成原點的 f16,離原點越遠越粗,超過就整組重建把原點拉回相機旁。ext 模式
+     * (f32 絕對座標)不受此限。`0` = 關閉快路徑(每次視角變動都 generate,v2.1.0 行為,A/B 用)。
+     * 讀數:`depthOnlyUpdates`(走快路徑的 update 次數)/ `depthOnlyPasses`(真的跑的 GPU pass 數)。
+     * ⚠️ 依賴 Spark 既有契約:視角相關的 generator 要自己 `updateVersion()`(SH 由
+     * `SplatMesh.update` 自動做;自訂 modifier 用到 viewToWorld 等要開 `enableViewToWorld` 等旗標)。
+     * 以前每次視角變動都重建,把漏開旗標的錯蓋住了;現在不會。
+     * @default 1.0
+     */
+    depthOnlyMaxOffset?: number;
+    /**
      * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
      * @default false
      */
@@ -385,6 +399,17 @@ export declare class SparkRenderer extends THREE.Mesh {
      * pack 都省掉(`packNow=false`),不只是延後上傳。
      */
     lodApplyIntervalMs: number;
+    /** 見 SparkRendererOptions.depthOnlyMaxOffset;可 live 改(下一次 updateInternal 生效)。 */
+    depthOnlyMaxOffset: number;
+    /** 累計:走 depth-only 快路徑(沒 generate)的 updateInternal 次數。 */
+    depthOnlyUpdates: number;
+    /** 累計:真的跑過的 depth-only GPU pass 數(每次排序最多一次,多幀視角變動會合併)。 */
+    depthOnlyPasses: number;
+    /**
+     * depth-only pass 的輸出(RGBA8 array target,layout 同 accumulator target 的深度 attachment)。
+     * 一個 renderer 共用一顆:readPixels 與後續的重寫都在 GL 命令序中排隊,先讀的一定拿到先寫的。
+     */
+    private depthOnlyTarget;
     /** 最近一次 tick 的讀數;null = 還沒 tick 過。 */
     lastLodTick: (LodTickStats & {
         neededChunks: number;
@@ -643,6 +668,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     private updateLodInstances;
     private cleanupLodTrees;
     private updateLodIndices;
+    private ensureDepthOnlyTarget;
     private readbackDepth;
     private saveRenderState;
     private resetRenderState;

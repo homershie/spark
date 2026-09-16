@@ -19,9 +19,16 @@ export declare class SplatAccumulator {
     viewToWorld: THREE.Matrix4;
     viewOrigin: THREE.Vector3;
     viewDirection: THREE.Vector3;
+    sortOrigin: THREE.Vector3;
+    sortDirection: THREE.Vector3;
+    depthSource: "target" | "depthOnly";
     static viewCenterUniform: DynoVec3<THREE.Vector3, "value">;
     static viewDirUniform: DynoVec3<THREE.Vector3, "value">;
     static sortRadialUniform: DynoBool<string>;
+    static depthViewCenterUniform: DynoVec3<THREE.Vector3, "value">;
+    static depthViewDirUniform: DynoVec3<THREE.Vector3, "value">;
+    static depthSortRadialUniform: DynoBool<string>;
+    static depthCenterOffsetUniform: DynoVec3<THREE.Vector3, "value">;
     maxSplats: number;
     numSplats: number;
     target: THREE.WebGLArrayRenderTarget | null;
@@ -40,6 +47,7 @@ export declare class SplatAccumulator {
     getTextures(): THREE.DataArrayTexture[];
     static emptyTexture: THREE.DataArrayTexture;
     static emptyTextures: THREE.DataArrayTexture[];
+    static depthSplatsUniform: DynoUsampler2DArray<"depthSplats", THREE.DataArrayTexture>;
     generateMapping(splatCounts: number[]): {
         maxSplats: number;
         mapping: {
@@ -69,6 +77,16 @@ export declare class SplatAccumulator {
     }): {
         nextBase: number;
     };
+    static depthProgramTemplate: DynoProgramTemplate;
+    static depthOnlyPrograms: (DynoProgram | undefined)[];
+    private static getDepthOnlyProgram;
+    regenerateDepth({ renderer, target, viewOrigin, viewDirection, sortRadial, }: {
+        renderer: THREE.WebGLRenderer;
+        target: THREE.WebGLArrayRenderTarget;
+        viewOrigin: THREE.Vector3;
+        viewDirection: THREE.Vector3;
+        sortRadial: boolean;
+    }): void;
     prepareGenerate({ renderer, scene, time, camera, sortRadial, renderSize, previous, lodInstances, }: {
         renderer: THREE.WebGLRenderer;
         scene: THREE.Scene;

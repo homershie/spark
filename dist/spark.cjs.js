@@ -7976,6 +7976,7 @@ async function __wbg_init(module_or_path) {
   const { instance, module: module2 } = await __wbg_load(await module_or_path, imports);
   return __wbg_finalize_init(instance);
 }
+var computeDepthVec4_default = "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\nprecision highp usampler2D;\nprecision highp isampler2D;\nprecision highp sampler2DArray;\nprecision highp usampler2DArray;\nprecision highp isampler2DArray;\nprecision highp sampler3D;\nprecision highp usampler3D;\nprecision highp isampler3D;\n\n#include <splatDefines>\n\nuniform uint targetLayer;\nuniform int targetBase;\nuniform int targetCount;\n\nlayout(location = 0) out vec4 target3;\n\n{{ GLOBALS }}\n\nvoid produceDepth(int _index) {\n    {{ STATEMENTS }}\n}\n\nvoid main() {\n    int targetIndex = int(targetLayer << SPLAT_TEX_LAYER_BITS) + int(uint(gl_FragCoord.y) << SPLAT_TEX_WIDTH_BITS) + int(gl_FragCoord.x);\n    int index = targetIndex - targetBase;\n\n    \n    target3 = floatToVec4(1.0 / 0.0);\n\n    if ((index >= 0) && (index < targetCount)) {\n        produceDepth(index);\n    }\n}";
 var computeUvec4_default = "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\nprecision highp usampler2D;\nprecision highp isampler2D;\nprecision highp sampler2DArray;\nprecision highp usampler2DArray;\nprecision highp isampler2DArray;\nprecision highp sampler3D;\nprecision highp usampler3D;\nprecision highp isampler3D;\n\n#include <splatDefines>\n\nuniform uint targetLayer;\nuniform int targetBase;\nuniform int targetCount;\n\nout uvec4 target;\n\n{{ GLOBALS }}\n\nvoid produceSplat(int _index) {\n    {{ STATEMENTS }}\n}\n\nvoid main() {\n    int targetIndex = int(targetLayer << SPLAT_TEX_LAYER_BITS) + int(uint(gl_FragCoord.y) << SPLAT_TEX_WIDTH_BITS) + int(gl_FragCoord.x);\n    int index = targetIndex - targetBase;\n\n    target = uvec4(0u, 0u, 0u, 0u);\n    if ((index >= 0) && (index < targetCount)) {\n        produceSplat(index);\n    }\n}";
 var computeUvec4_Vec4_default = "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\nprecision highp usampler2D;\nprecision highp isampler2D;\nprecision highp sampler2DArray;\nprecision highp usampler2DArray;\nprecision highp isampler2DArray;\nprecision highp sampler3D;\nprecision highp usampler3D;\nprecision highp isampler3D;\n\n#include <splatDefines>\n\nuniform uint targetLayer;\nuniform int targetBase;\nuniform int targetCount;\n\nlayout(location = 0) out uvec4 target;\nlayout(location = 1) out vec4 target3;\n\n{{ GLOBALS }}\n\nvoid produceSplat(int _index) {\n    {{ STATEMENTS }}\n}\n\nvoid main() {\n    int targetIndex = int(targetLayer << SPLAT_TEX_LAYER_BITS) + int(uint(gl_FragCoord.y) << SPLAT_TEX_WIDTH_BITS) + int(gl_FragCoord.x);\n    int index = targetIndex - targetBase;\n\n    \n    target = uvec4(0u, 0u, 0u, 0u);\n\n    \n    target3 = floatToVec4(1.0 / 0.0);\n\n    if ((index >= 0) && (index < targetCount)) {\n        produceSplat(index);\n    }\n}";
 var computeUvec4x2_Vec4_default = "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\nprecision highp usampler2D;\nprecision highp isampler2D;\nprecision highp sampler2DArray;\nprecision highp usampler2DArray;\nprecision highp isampler2DArray;\nprecision highp sampler3D;\nprecision highp usampler3D;\nprecision highp isampler3D;\n\n#include <splatDefines>\n\nuniform uint targetLayer;\nuniform int targetBase;\nuniform int targetCount;\n\nlayout(location = 0) out uvec4 target;\nlayout(location = 1) out uvec4 target2;\nlayout(location = 2) out vec4 target3;\n\n{{ GLOBALS }}\n\nvoid produceSplat(int _index) {\n    {{ STATEMENTS }}\n}\n\nvoid main() {\n    int targetIndex = int(targetLayer << SPLAT_TEX_LAYER_BITS) + int(uint(gl_FragCoord.y) << SPLAT_TEX_WIDTH_BITS) + int(gl_FragCoord.x);\n    int index = targetIndex - targetBase;\n\n    \n    target = uvec4(0u, 0u, 0u, 0u);\n    target2 = uvec4(0u, 0u, 0u, 0u);\n\n    \n    target3 = floatToVec4(1.0 / 0.0);\n\n    if ((index >= 0) && (index < targetCount)) {\n        produceSplat(index);\n    }\n}";
@@ -7997,7 +7998,8 @@ function getShaders() {
       computeVec4Template: computeVec4_default,
       computeUvec4Vec4Template: computeUvec4_Vec4_default,
       computeUvec4x2Vec4Template: computeUvec4x2_Vec4_default,
-      computeUvec4Template: computeUvec4_default
+      computeUvec4Template: computeUvec4_default,
+      computeDepthVec4Template: computeDepthVec4_default
     };
   }
   return shaders;
@@ -9273,6 +9275,9 @@ const _SplatAccumulator = class _SplatAccumulator {
     this.viewToWorld = new THREE__namespace.Matrix4();
     this.viewOrigin = new THREE__namespace.Vector3();
     this.viewDirection = new THREE__namespace.Vector3();
+    this.sortOrigin = new THREE__namespace.Vector3();
+    this.sortDirection = new THREE__namespace.Vector3();
+    this.depthSource = "target";
     this.maxSplats = 0;
     this.numSplats = 0;
     this.target = null;
@@ -9543,6 +9548,145 @@ const _SplatAccumulator = class _SplatAccumulator {
     this.resetRenderState(renderer, renderState);
     return { nextBase };
   }
+  // Build (once per layout) the depth-only program: read this accumulator's
+  // already generated packed splats, reconstruct the absolute center, and run
+  // the SAME outputSplatDepth dyno generate() uses so the sort worker receives
+  // an identical encoding. Splats are inactive iff their packed words are all
+  // zero (generate() writes uvec4(0) for !isGsplatActive), giving +inf depth.
+  static getDepthOnlyProgram(extSplats) {
+    const slot = extSplats ? 1 : 0;
+    let program = _SplatAccumulator.depthOnlyPrograms[slot];
+    if (program) {
+      return program;
+    }
+    const graph = dynoBlock(
+      { index: "int" },
+      {},
+      ({ index }, _outputs, { roots }) => {
+        if (!index) {
+          throw new Error("index input required");
+        }
+        const decoded = new Dyno({
+          inTypes: {
+            index: "int",
+            splats: "usampler2DArray",
+            offset: "vec3"
+          },
+          outTypes: { center: "vec3", flags: "uint" },
+          inputs: {
+            index,
+            splats: _SplatAccumulator.depthSplatsUniform,
+            offset: _SplatAccumulator.depthCenterOffsetUniform
+          },
+          globals: () => [defineGsplat],
+          statements: ({ inputs, outputs }) => {
+            const centerExpr = extSplats ? "unpackSplatExtCenterAlpha(packedData).xyz" : "vec3(unpackHalf2x16(packedData.y), unpackHalf2x16(packedData.z & 0xffffu).x)";
+            return unindentLines(`
+              ivec3 coord = splatTexCoord(${inputs.index});
+              uvec4 packedData = texelFetch(${inputs.splats}, coord, 0);
+              ${outputs.flags} = all(equal(packedData, uvec4(0u))) ? 0u : GSPLAT_FLAG_ACTIVE;
+              ${outputs.center} = ${centerExpr} + ${inputs.offset};
+            `);
+          }
+        });
+        const gsplat = combineGsplat({
+          flags: decoded.outputs.flags,
+          index,
+          center: decoded.outputs.center
+        });
+        roots.push(
+          outputSplatDepth(
+            gsplat,
+            _SplatAccumulator.depthViewCenterUniform,
+            _SplatAccumulator.depthViewDirUniform,
+            _SplatAccumulator.depthSortRadialUniform
+          )
+        );
+        return void 0;
+      }
+    );
+    program = new DynoProgram({
+      graph,
+      inputs: { index: "_index" },
+      outputs: {},
+      template: _SplatAccumulator.depthProgramTemplate
+      // consoleLog: true,
+    });
+    Object.assign(program.uniforms, {
+      targetLayer: { value: 0 },
+      targetBase: { value: 0 },
+      targetCount: { value: 0 }
+    });
+    _SplatAccumulator.depthOnlyPrograms[slot] = program;
+    return program;
+  }
+  // Depth-only fast path (SparkRenderer.updateInternal): the accumulator's
+  // content is unchanged (same version & mapping), only the view moved. Instead
+  // of regenerating every splat, re-derive the sort depth for the new view from
+  // the packed centers already in this.target, writing into a SEPARATE target
+  // (WebGL forbids sampling a texture attached to the bound framebuffer).
+  // `target` must be an RGBA8 array target with at least this.target's layers
+  // (SparkRenderer.ensureDepthOnlyTarget). Afterwards sortOrigin/sortDirection
+  // describe the new view and depthSource points readbackDepth at `target`.
+  regenerateDepth({
+    renderer,
+    target,
+    viewOrigin,
+    viewDirection,
+    sortRadial
+  }) {
+    if (!this.target) {
+      throw new Error("regenerateDepth requires a generated target");
+    }
+    if (target.depth < this.target.depth || target.height < this.target.height) {
+      throw new Error("Depth-only target is smaller than accumulator target");
+    }
+    const program = _SplatAccumulator.getDepthOnlyProgram(this.extSplats);
+    _SplatAccumulator.depthSplatsUniform.value = this.target.textures[0];
+    if (this.extSplats) {
+      _SplatAccumulator.depthCenterOffsetUniform.value.set(0, 0, 0);
+    } else {
+      _SplatAccumulator.depthCenterOffsetUniform.value.copy(this.viewOrigin);
+    }
+    _SplatAccumulator.depthViewCenterUniform.value.copy(viewOrigin);
+    _SplatAccumulator.depthViewDirUniform.value.copy(viewDirection);
+    _SplatAccumulator.depthSortRadialUniform.value = sortRadial;
+    program.update();
+    const material = program.prepareMaterial();
+    _SplatAccumulator.fullScreenQuad.material = material;
+    const renderState = this.saveRenderState(renderer);
+    const count = this.numSplats;
+    let base = 0;
+    const nextBase = Math.ceil(count / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+    const layerSize = SPLAT_TEX_WIDTH * SPLAT_TEX_HEIGHT;
+    material.uniforms.targetBase.value = 0;
+    material.uniforms.targetCount.value = count;
+    while (base < nextBase) {
+      const layer = Math.floor(base / layerSize);
+      material.uniforms.targetLayer.value = layer;
+      const layerBase = layer * layerSize;
+      const layerYStart = Math.floor((base - layerBase) / SPLAT_TEX_WIDTH);
+      const layerYEnd = Math.min(
+        SPLAT_TEX_HEIGHT,
+        Math.ceil((nextBase - layerBase) / SPLAT_TEX_WIDTH)
+      );
+      target.scissor.set(
+        0,
+        layerYStart,
+        SPLAT_TEX_WIDTH,
+        layerYEnd - layerYStart
+      );
+      renderer.setRenderTarget(target, layer);
+      renderer.xr.enabled = false;
+      renderer.autoClear = false;
+      _SplatAccumulator.fullScreenQuad.render(renderer);
+      base += SPLAT_TEX_WIDTH * (layerYEnd - layerYStart);
+    }
+    this.resetRenderState(renderer, renderState);
+    this.sortOrigin.copy(viewOrigin);
+    this.sortDirection.copy(viewDirection);
+    this.depthSource = "depthOnly";
+  }
   prepareGenerate({
     renderer,
     scene,
@@ -9557,6 +9701,9 @@ const _SplatAccumulator = class _SplatAccumulator {
     this.viewToWorld.copy(camera.matrixWorld);
     camera.getWorldPosition(this.viewOrigin);
     camera.getWorldDirection(this.viewDirection);
+    this.sortOrigin.copy(this.viewOrigin);
+    this.sortDirection.copy(this.viewDirection);
+    this.depthSource = "target";
     _SplatAccumulator.viewCenterUniform.value.copy(this.viewOrigin);
     _SplatAccumulator.viewDirUniform.value.copy(this.viewDirection);
     _SplatAccumulator.sortRadialUniform.value = sortRadial;
@@ -9764,6 +9911,12 @@ const _SplatAccumulator = class _SplatAccumulator {
 _SplatAccumulator.viewCenterUniform = new DynoVec3({ value: new THREE__namespace.Vector3() });
 _SplatAccumulator.viewDirUniform = new DynoVec3({ value: new THREE__namespace.Vector3() });
 _SplatAccumulator.sortRadialUniform = new DynoBool({ value: true });
+_SplatAccumulator.depthViewCenterUniform = new DynoVec3({ value: new THREE__namespace.Vector3() });
+_SplatAccumulator.depthViewDirUniform = new DynoVec3({ value: new THREE__namespace.Vector3() });
+_SplatAccumulator.depthSortRadialUniform = new DynoBool({ value: true });
+_SplatAccumulator.depthCenterOffsetUniform = new DynoVec3({
+  value: new THREE__namespace.Vector3()
+});
 _SplatAccumulator.emptyTexture = (() => {
   const { width, height, depth, maxSplats } = getTextureSize(1);
   const emptyArray = new Uint32Array(maxSplats * 4);
@@ -9782,6 +9935,10 @@ _SplatAccumulator.emptyTexture = (() => {
 _SplatAccumulator.emptyTextures = (() => {
   return [_SplatAccumulator.emptyTexture, _SplatAccumulator.emptyTexture];
 })();
+_SplatAccumulator.depthSplatsUniform = new DynoUsampler2DArray({
+  value: _SplatAccumulator.emptyTexture,
+  key: "depthSplats"
+});
 _SplatAccumulator.programExtTemplate = new DynoProgramTemplate(
   getShaders().computeUvec4x2Vec4Template
 );
@@ -9792,6 +9949,10 @@ _SplatAccumulator.generatorProgram = /* @__PURE__ */ new WeakMap();
 _SplatAccumulator.fullScreenQuad = new Pass_js.FullScreenQuad(
   new THREE__namespace.RawShaderMaterial({ visible: false })
 );
+_SplatAccumulator.depthProgramTemplate = new DynoProgramTemplate(
+  getShaders().computeDepthVec4Template
+);
+_SplatAccumulator.depthOnlyPrograms = [];
 let SplatAccumulator = _SplatAccumulator;
 class SplatGeometry extends THREE__namespace.InstancedBufferGeometry {
   constructor() {
@@ -9815,6 +9976,26 @@ const QUAD_VERTICES = new Float32Array([
   0
 ]);
 const QUAD_INDICES = new Uint16Array([0, 1, 2, 0, 2, 3]);
+function canDepthOnly({
+  viewChanged,
+  versionSame,
+  mappingSame,
+  hasTarget,
+  extSplats,
+  originOffset,
+  maxOffset
+}) {
+  if (!viewChanged || !versionSame || !mappingSame || !hasTarget) {
+    return false;
+  }
+  if (!(maxOffset > 0)) {
+    return false;
+  }
+  if (extSplats) {
+    return true;
+  }
+  return originOffset <= maxOffset;
+}
 const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
   constructor(options) {
     if (!options) {
@@ -9856,6 +10037,9 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.sortedCenter = new THREE__namespace.Vector3().setScalar(Number.NEGATIVE_INFINITY);
     this.sortedDir = new THREE__namespace.Vector3().setScalar(0);
     this.readback32 = new Uint32Array(0);
+    this.depthOnlyUpdates = 0;
+    this.depthOnlyPasses = 0;
+    this.depthOnlyTarget = null;
     this.lastLodTick = null;
     this.lodTickSeq = 0;
     this.lodSettleMs = null;
@@ -9936,6 +10120,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.lodTickMs = options.lodTickMs ?? 20;
     this.lodHysteresis = options.lodHysteresis ?? 0.05;
     this.lodApplyIntervalMs = options.lodApplyIntervalMs ?? 50;
+    this.depthOnlyMaxOffset = options.depthOnlyMaxOffset ?? 1;
     this.lodInflate = options.lodInflate ?? false;
     this.pagedExtSplats = options.pagedExtSplats ?? false;
     const defaultPages = isMobile() ? isIos() ? 96 : 128 : 256;
@@ -10066,6 +10251,10 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     if (this.orderingTexture) {
       this.orderingTexture.dispose();
       this.orderingTexture = null;
+    }
+    if (this.depthOnlyTarget) {
+      this.depthOnlyTarget.dispose();
+      this.depthOnlyTarget = null;
     }
     const accumulators = /* @__PURE__ */ new Set();
     accumulators.add(this.display);
@@ -10265,8 +10454,25 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     if (mappingUpdated && this.sorting) {
       doUpdate = false;
     }
+    const depthOnly = doUpdate && canDepthOnly({
+      viewChanged,
+      versionSame: version === this.current.version,
+      mappingSame: mappingVersion === this.current.mappingVersion,
+      hasTarget: this.current.target !== null,
+      extSplats: this.current.extSplats,
+      originOffset: center.distanceTo(this.current.viewOrigin),
+      maxOffset: this.depthOnlyMaxOffset
+    });
     if (!doUpdate) {
       this.accumulators.push(next);
+    } else if (depthOnly) {
+      this.accumulators.push(next);
+      this.current.sortOrigin.copy(center);
+      this.current.sortDirection.copy(dir);
+      this.current.depthSource = "depthOnly";
+      this.depthOnlyUpdates++;
+      this.sortDirty = true;
+      this.setDirty();
     } else {
       generate();
       if (this.flushAfterGenerate) {
@@ -10314,8 +10520,8 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       await new Promise((resolve) => setTimeout(resolve, this.readPause));
     }
     const current = this.current;
-    this.sortedCenter.copy(current.viewOrigin);
-    this.sortedDir.copy(current.viewDirection);
+    this.sortedCenter.copy(current.sortOrigin);
+    this.sortedDir.copy(current.sortDirection);
     const { numSplats, maxSplats } = current;
     const rows = Math.max(1, Math.ceil(maxSplats / 16384));
     const orderingMaxSplats = rows * 16384;
@@ -10327,7 +10533,8 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       current,
       renderer: this.renderer,
       numSplats,
-      readback
+      readback,
+      sortRadial: this.sortRadial ?? true
     });
     if (this.sortPause > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.sortPause));
@@ -10864,17 +11071,65 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       if (rec) rec.version = mesh.version + 1;
     }
   }
+  // RGBA8 array target for the depth-only pass, sized to (at least) the given
+  // accumulator's target. Lazily allocated; grown when a larger accumulator
+  // target shows up. Format matches the generate() depth attachment so the
+  // same readback buffer / decoding applies.
+  ensureDepthOnlyTarget(current) {
+    const src = current.target;
+    if (!src) {
+      throw new Error("No target");
+    }
+    const t = this.depthOnlyTarget;
+    if (t && t.width >= src.width && t.height >= src.height && t.depth >= src.depth) {
+      return t;
+    }
+    const width = Math.max((t == null ? void 0 : t.width) ?? 0, src.width);
+    const height = Math.max((t == null ? void 0 : t.height) ?? 0, src.height);
+    const depth = Math.max((t == null ? void 0 : t.depth) ?? 0, src.depth);
+    if (t) {
+      t.dispose();
+    }
+    const target = new THREE__namespace.WebGLArrayRenderTarget(width, height, depth, {
+      depthBuffer: false,
+      stencilBuffer: false,
+      generateMipmaps: false,
+      magFilter: THREE__namespace.NearestFilter,
+      minFilter: THREE__namespace.NearestFilter
+    });
+    target.texture.format = THREE__namespace.RGBAFormat;
+    target.texture.type = THREE__namespace.UnsignedByteType;
+    target.texture.internalFormat = "RGBA8";
+    target.scissorTest = true;
+    this.depthOnlyTarget = target;
+    return target;
+  }
   async readbackDepth({
     current,
     renderer,
     numSplats,
-    readback
+    readback,
+    sortRadial
   }) {
     if (!renderer) {
       throw new Error("No renderer");
     }
     if (!current.target) {
       throw new Error("No target");
+    }
+    let target = current.target;
+    let textureIndex = current.extSplats ? 2 : 1;
+    if (current.depthSource === "depthOnly") {
+      target = this.ensureDepthOnlyTarget(current);
+      current.regenerateDepth({
+        renderer,
+        target,
+        viewOrigin: current.sortOrigin,
+        viewDirection: current.sortDirection,
+        sortRadial
+      });
+      this.depthOnlyPasses++;
+      textureIndex = 0;
     }
     const roundedCount = Math.ceil(numSplats / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
     if (readback.byteLength < roundedCount * 4) {
@@ -10899,16 +11154,16 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         layerBase * 4,
         layerBase * 4 + readbackSize
       );
-      renderer.setRenderTarget(current.target, layer);
+      renderer.setRenderTarget(target, layer);
       const promise = renderer.readRenderTargetPixelsAsync(
-        current.target,
+        target,
         0,
         0,
         SPLAT_TEX_WIDTH,
         layerYEnd,
         subReadback,
         void 0,
-        current.extSplats ? 2 : 1
+        textureIndex
       );
       promises.push(promise);
       if (this.flushAfterRead) {

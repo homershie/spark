@@ -12,6 +12,7 @@ import { SplatAccumulator } from "./SplatAccumulator";
 import { SplatGeometry } from "./SplatGeometry";
 import { SplatWorker } from "./SplatWorker";
 import { SPLAT_TEX_HEIGHT, SPLAT_TEX_WIDTH } from "./defines";
+import { canDepthOnly } from "./depthOnly";
 import { getShaders } from "./shaders";
 import {
   cloneClock,
@@ -225,6 +226,20 @@ export interface SparkRendererOptions {
    */
   lodApplyIntervalMs?: number;
   /**
+   * 「只重排序、不重建」快路徑(`src/depthOnly.ts`):相機動了但 accumulator 內容沒變
+   * (version / mapping 都相同)時,不重跑每顆 mesh 的 generate pass,只用一個 depth-only pass
+   * 從已生好的 packed 中心重算排序鍵(`SplatAccumulator.regenerateDepth`)。這個值是**非 ext
+   * 模式**(`accumExtSplats: false`,預設)允許相機離開生成原點的最大距離(世界單位):packed
+   * 中心是相對生成原點的 f16,離原點越遠越粗,超過就整組重建把原點拉回相機旁。ext 模式
+   * (f32 絕對座標)不受此限。`0` = 關閉快路徑(每次視角變動都 generate,v2.1.0 行為,A/B 用)。
+   * 讀數:`depthOnlyUpdates`(走快路徑的 update 次數)/ `depthOnlyPasses`(真的跑的 GPU pass 數)。
+   * ⚠️ 依賴 Spark 既有契約:視角相關的 generator 要自己 `updateVersion()`(SH 由
+   * `SplatMesh.update` 自動做;自訂 modifier 用到 viewToWorld 等要開 `enableViewToWorld` 等旗標)。
+   * 以前每次視角變動都重建,把漏開旗標的錯蓋住了;現在不會。
+   * @default 1.0
+   */
+  depthOnlyMaxOffset?: number;
+  /**
    * Inflate LoD splats to ensure opacity stays <= 1.0, producing a softer appearance.
    * @default false
    */
@@ -424,6 +439,17 @@ export class SparkRenderer extends THREE.Mesh {
    * pack 都省掉(`packNow=false`),不只是延後上傳。
    */
   lodApplyIntervalMs: number;
+  /** 見 SparkRendererOptions.depthOnlyMaxOffset;可 live 改(下一次 updateInternal 生效)。 */
+  depthOnlyMaxOffset: number;
+  /** 累計:走 depth-only 快路徑(沒 generate)的 updateInternal 次數。 */
+  depthOnlyUpdates = 0;
+  /** 累計:真的跑過的 depth-only GPU pass 數(每次排序最多一次,多幀視角變動會合併)。 */
+  depthOnlyPasses = 0;
+  /**
+   * depth-only pass 的輸出(RGBA8 array target,layout 同 accumulator target 的深度 attachment)。
+   * 一個 renderer 共用一顆:readPixels 與後續的重寫都在 GL 命令序中排隊,先讀的一定拿到先寫的。
+   */
+  private depthOnlyTarget: THREE.WebGLArrayRenderTarget | null = null;
   /** 最近一次 tick 的讀數;null = 還沒 tick 過。 */
   lastLodTick:
     | (LodTickStats & { neededChunks: number; pagePressure: boolean })
@@ -645,6 +671,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.lodTickMs = options.lodTickMs ?? 20;
     this.lodHysteresis = options.lodHysteresis ?? 0.05;
     this.lodApplyIntervalMs = options.lodApplyIntervalMs ?? 50;
+    this.depthOnlyMaxOffset = options.depthOnlyMaxOffset ?? 1.0;
     this.lodInflate = options.lodInflate ?? false;
     this.pagedExtSplats = options.pagedExtSplats ?? false;
     const defaultPages = isMobile() ? (isIos() ? 96 : 128) : 256;
@@ -788,6 +815,10 @@ export class SparkRenderer extends THREE.Mesh {
     if (this.orderingTexture) {
       this.orderingTexture.dispose();
       this.orderingTexture = null;
+    }
+    if (this.depthOnlyTarget) {
+      this.depthOnlyTarget.dispose();
+      this.depthOnlyTarget = null;
     }
 
     const accumulators = new Set<SplatAccumulator>();
@@ -1041,9 +1072,34 @@ export class SparkRenderer extends THREE.Mesh {
       doUpdate = false;
     }
 
+    // Depth-only fast path: content unchanged (version & mapping), only the view
+    // moved. Skip generate() entirely; the sort keys are re-derived from the
+    // packed centers already in this.current by readbackDepth (regenerateDepth)
+    // when the next sort runs, so several view changes between sorts collapse
+    // into a single cheap pass. this.current / this.display keep their identity.
+    const depthOnly =
+      doUpdate &&
+      canDepthOnly({
+        viewChanged,
+        versionSame: version === this.current.version,
+        mappingSame: mappingVersion === this.current.mappingVersion,
+        hasTarget: this.current.target !== null,
+        extSplats: this.current.extSplats,
+        originOffset: center.distanceTo(this.current.viewOrigin),
+        maxOffset: this.depthOnlyMaxOffset,
+      });
+
     if (!doUpdate) {
       // Restore unused accumulator to the free list
       this.accumulators.push(next);
+    } else if (depthOnly) {
+      this.accumulators.push(next);
+      this.current.sortOrigin.copy(center);
+      this.current.sortDirection.copy(dir);
+      this.current.depthSource = "depthOnly";
+      this.depthOnlyUpdates++;
+      this.sortDirty = true;
+      this.setDirty();
     } else {
       generate();
 
@@ -1107,8 +1163,10 @@ export class SparkRenderer extends THREE.Mesh {
 
     const current = this.current;
 
-    this.sortedCenter.copy(current.viewOrigin);
-    this.sortedDir.copy(current.viewDirection);
+    // The view the sort keys are computed for: equals viewOrigin/viewDirection
+    // after generate(), or the newer view set by the depth-only fast path.
+    this.sortedCenter.copy(current.sortOrigin);
+    this.sortedDir.copy(current.sortDirection);
 
     const { numSplats, maxSplats } = current;
     const rows = Math.max(1, Math.ceil(maxSplats / 16384));
@@ -1124,6 +1182,7 @@ export class SparkRenderer extends THREE.Mesh {
       renderer: this.renderer,
       numSplats,
       readback,
+      sortRadial: this.sortRadial ?? true,
     });
 
     if (this.sortPause > 0) {
@@ -1879,22 +1938,85 @@ export class SparkRenderer extends THREE.Mesh {
     }
   }
 
+  // RGBA8 array target for the depth-only pass, sized to (at least) the given
+  // accumulator's target. Lazily allocated; grown when a larger accumulator
+  // target shows up. Format matches the generate() depth attachment so the
+  // same readback buffer / decoding applies.
+  private ensureDepthOnlyTarget(
+    current: SplatAccumulator,
+  ): THREE.WebGLArrayRenderTarget {
+    const src = current.target;
+    if (!src) {
+      throw new Error("No target");
+    }
+    const t = this.depthOnlyTarget;
+    if (
+      t &&
+      t.width >= src.width &&
+      t.height >= src.height &&
+      t.depth >= src.depth
+    ) {
+      return t;
+    }
+    // Grow to the max of both so alternating accumulator shapes cannot thrash
+    const width = Math.max(t?.width ?? 0, src.width);
+    const height = Math.max(t?.height ?? 0, src.height);
+    const depth = Math.max(t?.depth ?? 0, src.depth);
+    if (t) {
+      t.dispose();
+    }
+    const target = new THREE.WebGLArrayRenderTarget(width, height, depth, {
+      depthBuffer: false,
+      stencilBuffer: false,
+      generateMipmaps: false,
+      magFilter: THREE.NearestFilter,
+      minFilter: THREE.NearestFilter,
+    });
+    target.texture.format = THREE.RGBAFormat;
+    target.texture.type = THREE.UnsignedByteType;
+    target.texture.internalFormat = "RGBA8";
+    target.scissorTest = true;
+    this.depthOnlyTarget = target;
+    return target;
+  }
+
   private async readbackDepth({
     current,
     renderer,
     numSplats,
     readback,
+    sortRadial,
   }: {
     current: SplatAccumulator;
     renderer: THREE.WebGLRenderer;
     numSplats: number;
     readback: Uint32Array;
+    sortRadial: boolean;
   }) {
     if (!renderer) {
       throw new Error("No renderer");
     }
     if (!current.target) {
       throw new Error("No target");
+    }
+
+    // Which target holds the depth for current.sortOrigin/sortDirection.
+    // "depthOnly": the fast path moved the sort view without regenerating, so
+    // render the depth-only pass now (synchronously, before any readPixels is
+    // enqueued) into the shared aux target and read attachment 0 from it.
+    let target: THREE.WebGLArrayRenderTarget = current.target;
+    let textureIndex = current.extSplats ? 2 : 1;
+    if (current.depthSource === "depthOnly") {
+      target = this.ensureDepthOnlyTarget(current);
+      current.regenerateDepth({
+        renderer,
+        target,
+        viewOrigin: current.sortOrigin,
+        viewDirection: current.sortDirection,
+        sortRadial,
+      });
+      this.depthOnlyPasses++;
+      textureIndex = 0;
     }
 
     const roundedCount =
@@ -1928,17 +2050,17 @@ export class SparkRenderer extends THREE.Mesh {
         layerBase * 4,
         layerBase * 4 + readbackSize,
       );
-      renderer.setRenderTarget(current.target, layer);
+      renderer.setRenderTarget(target, layer);
 
       const promise = renderer.readRenderTargetPixelsAsync(
-        current.target,
+        target,
         0,
         0,
         SPLAT_TEX_WIDTH,
         layerYEnd,
         subReadback,
         undefined,
-        current.extSplats ? 2 : 1,
+        textureIndex,
       );
       promises.push(promise);
 

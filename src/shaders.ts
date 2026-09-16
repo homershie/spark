@@ -1,5 +1,6 @@
 import * as THREE from "three";
 
+import computeDepthVec4Template from "./shaders/computeDepthVec4.glsl";
 import computeUvec4Template from "./shaders/computeUvec4.glsl";
 import computeUvec4Vec4Template from "./shaders/computeUvec4_Vec4.glsl";
 import computeUvec4x2Vec4Template from "./shaders/computeUvec4x2_Vec4.glsl";
@@ -25,6 +26,7 @@ export function getShaders(): Record<string, string> {
       computeUvec4Vec4Template,
       computeUvec4x2Vec4Template,
       computeUvec4Template,
+      computeDepthVec4Template,
     };
   }
   return shaders;

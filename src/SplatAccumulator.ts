@@ -25,6 +25,7 @@ import {
   DynoVec3,
   combineCovSplat,
   combineGsplat,
+  defineGsplat,
   dynoBlock,
   dynoConst,
   gsplatToCovSplat,
@@ -59,11 +60,33 @@ export class SplatAccumulator {
   time = 0;
   deltaTime = 0;
   viewToWorld = new THREE.Matrix4();
+  // Camera pose at generate() time. In non-extSplats mode viewOrigin is ALSO the
+  // reference origin the packed f16 centers are relative to (SparkRenderer.render
+  // builds accumToWorld from it), so it must not be overwritten by a later view.
   viewOrigin = new THREE.Vector3();
   viewDirection = new THREE.Vector3();
+  // The view the depth (sort key) attachment was computed for. Equal to
+  // viewOrigin/viewDirection right after generate(); moved by the depth-only
+  // fast path (regenerateDepth) without touching viewOrigin. driveSort copies
+  // sortedCenter/sortedDir from these.
+  sortOrigin = new THREE.Vector3();
+  sortDirection = new THREE.Vector3();
+  // Which render target holds the depth matching sortOrigin/sortDirection:
+  // "target" = attachment written by generate(); "depthOnly" = the separate
+  // depth-only target must be (re)rendered by regenerateDepth() before readback.
+  depthSource: "target" | "depthOnly" = "target";
   static viewCenterUniform = new DynoVec3({ value: new THREE.Vector3() });
   static viewDirUniform = new DynoVec3({ value: new THREE.Vector3() });
   static sortRadialUniform = new DynoBool({ value: true });
+  // Depth-only pass uniforms (kept separate from the generate() ones: there the
+  // view center is both the packing origin and the sort center, here they differ).
+  static depthViewCenterUniform = new DynoVec3({ value: new THREE.Vector3() });
+  static depthViewDirUniform = new DynoVec3({ value: new THREE.Vector3() });
+  static depthSortRadialUniform = new DynoBool({ value: true });
+  // Non-ext: packed center + this offset = absolute center (= viewOrigin at generate time)
+  static depthCenterOffsetUniform = new DynoVec3({
+    value: new THREE.Vector3(),
+  });
   maxSplats = 0;
   numSplats = 0;
   target: THREE.WebGLArrayRenderTarget | null = null;
@@ -122,6 +145,14 @@ export class SplatAccumulator {
   static emptyTextures = (() => {
     return [SplatAccumulator.emptyTexture, SplatAccumulator.emptyTexture];
   })();
+
+  // Depth-only pass input: the accumulator's own packed texture (textures[0]
+  // holds the center in both layouts). Declared after emptyTexture on purpose:
+  // static initializers run in declaration order.
+  static depthSplatsUniform = new DynoUsampler2DArray({
+    value: SplatAccumulator.emptyTexture,
+    key: "depthSplats",
+  });
 
   // Given an array of splatCounts (.numSplats for each
   // SplatGenerator/SplatMesh in the scene), compute a
@@ -430,6 +461,180 @@ export class SplatAccumulator {
     return { nextBase };
   }
 
+  static depthProgramTemplate = new DynoProgramTemplate(
+    getShaders().computeDepthVec4Template,
+  );
+  // One program per packed layout (index 0 = non-ext f16 centers, 1 = ext f32
+  // centers). covSplats does not matter: the center occupies the same words.
+  static depthOnlyPrograms: (DynoProgram | undefined)[] = [];
+
+  // Build (once per layout) the depth-only program: read this accumulator's
+  // already generated packed splats, reconstruct the absolute center, and run
+  // the SAME outputSplatDepth dyno generate() uses so the sort worker receives
+  // an identical encoding. Splats are inactive iff their packed words are all
+  // zero (generate() writes uvec4(0) for !isGsplatActive), giving +inf depth.
+  private static getDepthOnlyProgram(extSplats: boolean): DynoProgram {
+    const slot = extSplats ? 1 : 0;
+    let program = SplatAccumulator.depthOnlyPrograms[slot];
+    if (program) {
+      return program;
+    }
+    const graph = dynoBlock(
+      { index: "int" },
+      {},
+      ({ index }, _outputs, { roots }) => {
+        if (!index) {
+          throw new Error("index input required");
+        }
+        const decoded = new Dyno({
+          inTypes: {
+            index: "int",
+            splats: "usampler2DArray",
+            offset: "vec3",
+          },
+          outTypes: { center: "vec3", flags: "uint" },
+          inputs: {
+            index,
+            splats: SplatAccumulator.depthSplatsUniform,
+            offset: SplatAccumulator.depthCenterOffsetUniform,
+          },
+          globals: () => [defineGsplat],
+          statements: ({ inputs, outputs }) => {
+            // ext: packSplatExt stores the f32 center in words x/y/z (absolute);
+            // non-ext: packSplatEncoding stores f16 center.xy in word1 and
+            // center.z in the low half of word2, relative to viewOrigin.
+            const centerExpr = extSplats
+              ? "unpackSplatExtCenterAlpha(packedData).xyz"
+              : "vec3(unpackHalf2x16(packedData.y), unpackHalf2x16(packedData.z & 0xffffu).x)";
+            return unindentLines(`
+              ivec3 coord = splatTexCoord(${inputs.index});
+              uvec4 packedData = texelFetch(${inputs.splats}, coord, 0);
+              ${outputs.flags} = all(equal(packedData, uvec4(0u))) ? 0u : GSPLAT_FLAG_ACTIVE;
+              ${outputs.center} = ${centerExpr} + ${inputs.offset};
+            `);
+          },
+        });
+        const gsplat = combineGsplat({
+          flags: decoded.outputs.flags,
+          index,
+          center: decoded.outputs.center,
+        });
+        roots.push(
+          outputSplatDepth(
+            gsplat,
+            SplatAccumulator.depthViewCenterUniform,
+            SplatAccumulator.depthViewDirUniform,
+            SplatAccumulator.depthSortRadialUniform,
+          ),
+        );
+        return undefined;
+      },
+    );
+    program = new DynoProgram({
+      graph,
+      inputs: { index: "_index" },
+      outputs: {},
+      template: SplatAccumulator.depthProgramTemplate,
+      // consoleLog: true,
+    });
+    Object.assign(program.uniforms, {
+      targetLayer: { value: 0 },
+      targetBase: { value: 0 },
+      targetCount: { value: 0 },
+    });
+    SplatAccumulator.depthOnlyPrograms[slot] = program;
+    return program;
+  }
+
+  // Depth-only fast path (SparkRenderer.updateInternal): the accumulator's
+  // content is unchanged (same version & mapping), only the view moved. Instead
+  // of regenerating every splat, re-derive the sort depth for the new view from
+  // the packed centers already in this.target, writing into a SEPARATE target
+  // (WebGL forbids sampling a texture attached to the bound framebuffer).
+  // `target` must be an RGBA8 array target with at least this.target's layers
+  // (SparkRenderer.ensureDepthOnlyTarget). Afterwards sortOrigin/sortDirection
+  // describe the new view and depthSource points readbackDepth at `target`.
+  regenerateDepth({
+    renderer,
+    target,
+    viewOrigin,
+    viewDirection,
+    sortRadial,
+  }: {
+    renderer: THREE.WebGLRenderer;
+    target: THREE.WebGLArrayRenderTarget;
+    viewOrigin: THREE.Vector3;
+    viewDirection: THREE.Vector3;
+    sortRadial: boolean;
+  }) {
+    if (!this.target) {
+      throw new Error("regenerateDepth requires a generated target");
+    }
+    if (
+      target.depth < this.target.depth ||
+      target.height < this.target.height
+    ) {
+      throw new Error("Depth-only target is smaller than accumulator target");
+    }
+
+    const program = SplatAccumulator.getDepthOnlyProgram(this.extSplats);
+    SplatAccumulator.depthSplatsUniform.value = this.target.textures[0];
+    if (this.extSplats) {
+      SplatAccumulator.depthCenterOffsetUniform.value.set(0, 0, 0);
+    } else {
+      // packed center is relative to the origin generate() used
+      SplatAccumulator.depthCenterOffsetUniform.value.copy(this.viewOrigin);
+    }
+    SplatAccumulator.depthViewCenterUniform.value.copy(viewOrigin);
+    SplatAccumulator.depthViewDirUniform.value.copy(viewDirection);
+    SplatAccumulator.depthSortRadialUniform.value = sortRadial;
+    program.update();
+
+    const material = program.prepareMaterial();
+    SplatAccumulator.fullScreenQuad.material = material;
+
+    const renderState = this.saveRenderState(renderer);
+
+    // Same layer / row-range walk as generate(), over [0, numSplats)
+    const count = this.numSplats;
+    let base = 0;
+    const nextBase = Math.ceil(count / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+    const layerSize = SPLAT_TEX_WIDTH * SPLAT_TEX_HEIGHT;
+    material.uniforms.targetBase.value = 0;
+    material.uniforms.targetCount.value = count;
+
+    while (base < nextBase) {
+      const layer = Math.floor(base / layerSize);
+      material.uniforms.targetLayer.value = layer;
+
+      const layerBase = layer * layerSize;
+      const layerYStart = Math.floor((base - layerBase) / SPLAT_TEX_WIDTH);
+      const layerYEnd = Math.min(
+        SPLAT_TEX_HEIGHT,
+        Math.ceil((nextBase - layerBase) / SPLAT_TEX_WIDTH),
+      );
+
+      target.scissor.set(
+        0,
+        layerYStart,
+        SPLAT_TEX_WIDTH,
+        layerYEnd - layerYStart,
+      );
+      renderer.setRenderTarget(target, layer);
+      renderer.xr.enabled = false;
+      renderer.autoClear = false;
+      SplatAccumulator.fullScreenQuad.render(renderer);
+
+      base += SPLAT_TEX_WIDTH * (layerYEnd - layerYStart);
+    }
+
+    this.resetRenderState(renderer, renderState);
+
+    this.sortOrigin.copy(viewOrigin);
+    this.sortDirection.copy(viewDirection);
+    this.depthSource = "depthOnly";
+  }
+
   prepareGenerate({
     renderer,
     scene,
@@ -455,6 +660,10 @@ export class SplatAccumulator {
     this.viewToWorld.copy(camera.matrixWorld);
     camera.getWorldPosition(this.viewOrigin);
     camera.getWorldDirection(this.viewDirection);
+    // generate() writes the depth attachment for exactly this view
+    this.sortOrigin.copy(this.viewOrigin);
+    this.sortDirection.copy(this.viewDirection);
+    this.depthSource = "target";
     SplatAccumulator.viewCenterUniform.value.copy(this.viewOrigin);
     SplatAccumulator.viewDirUniform.value.copy(this.viewDirection);
     SplatAccumulator.sortRadialUniform.value = sortRadial;
