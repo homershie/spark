@@ -553,7 +553,8 @@ export class SplatAccumulator {
   // (WebGL forbids sampling a texture attached to the bound framebuffer).
   // `target` must be an RGBA8 array target with at least this.target's layers
   // (SparkRenderer.ensureDepthOnlyTarget). Afterwards sortOrigin/sortDirection
-  // describe the new view and depthSource points readbackDepth at `target`.
+  // describe the new view; depthSource ("depthOnly", set by the caller that
+  // moved the view) already points readbackDepth at `target`.
   regenerateDepth({
     renderer,
     target,
@@ -630,9 +631,16 @@ export class SplatAccumulator {
 
     this.resetRenderState(renderer, renderState);
 
+    // After this call the sort keys in `target` describe exactly this view.
+    // depthSource is deliberately NOT written here: it means "the depth for
+    // sortOrigin/sortDirection is not in this.target's attachment, readbackDepth
+    // must render it into the aux target", is set by whoever moves sortOrigin
+    // away from viewOrigin (SparkRenderer.updateInternal fast path) and is read
+    // non-destructively by readbackDepth every time it runs. Rendering does not
+    // change that state, so re-writing it would only suggest a "needs render"
+    // one-shot semantic that does not exist.
     this.sortOrigin.copy(viewOrigin);
     this.sortDirection.copy(viewDirection);
-    this.depthSource = "depthOnly";
   }
 
   prepareGenerate({

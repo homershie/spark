@@ -9627,7 +9627,8 @@ const _SplatAccumulator = class _SplatAccumulator {
   // (WebGL forbids sampling a texture attached to the bound framebuffer).
   // `target` must be an RGBA8 array target with at least this.target's layers
   // (SparkRenderer.ensureDepthOnlyTarget). Afterwards sortOrigin/sortDirection
-  // describe the new view and depthSource points readbackDepth at `target`.
+  // describe the new view; depthSource ("depthOnly", set by the caller that
+  // moved the view) already points readbackDepth at `target`.
   regenerateDepth({
     renderer,
     target,
@@ -9685,7 +9686,6 @@ const _SplatAccumulator = class _SplatAccumulator {
     this.resetRenderState(renderer, renderState);
     this.sortOrigin.copy(viewOrigin);
     this.sortDirection.copy(viewDirection);
-    this.depthSource = "depthOnly";
   }
   prepareGenerate({
     renderer,
